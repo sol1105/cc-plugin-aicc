@@ -120,7 +120,7 @@ def _compare_units(candidate_units: str, entry_units: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 
-class AICC(BaseNCCheck):
+class AICC(BaseNCCheck, BaseCheck):
     """AWI ICON Coordinate Checker for CMIP7 unstructured model output."""
 
     register_checker = True
@@ -132,6 +132,9 @@ class AICC(BaseNCCheck):
     )
     _cc_url = ""
     _cc_display_headers = {3: "Required", 2: "Recommended", 1: "Suggested"}
+
+    def __init__(self, options=None):
+        BaseCheck.__init__(self, options)
 
     @classmethod
     def make_result(cls, level, score, out_of, name, messages):
