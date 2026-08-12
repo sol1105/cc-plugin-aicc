@@ -31,21 +31,32 @@ _DEFAULT_TABLES_PATH = os.environ.get(
     str(Path(__file__).resolve().parent.parent.parent / "cmip7-cmor-tables" / "tables"),
 )
 
-# Default vertical coordinate mapping: source_id_substring -> {generic_id: coord_entry_name}
-# Longer (more-specific) keys take precedence over shorter ones.
-# Pass a custom dict or path to a JSON file via the 'vertical_config' checker option.
-_DEFAULT_VERTICAL_CONFIG = {
-    "AWI": {
-        "alevel": "alternate_hybrid_sigma",
-        "alevhalf": "alternate_hybrid_sigma_half",
-        "olevel": "depth_coord",
-        "olevhalf": "depth_coord_half",
+# Per-model configuration: source_id_substring -> {"vertical": {...}, "horizontal": {...}}
+# Longer (more-specific) source_id keys take precedence.
+# Pass a custom dict or path to a JSON file via the 'model_config' checker option.
+_DEFAULT_CONFIG = {
+    "AWI-ESM": {
+        "vertical": {
+            "alevel": "alternate_hybrid_sigma",
+            "alevhalf": "alternate_hybrid_sigma_half",
+            "olevel": "depth_coord",
+            "olevhalf": "depth_coord_half",
+        },
+        "horizontal": {
+            "default": "unstructured",
+            "g122": "unstructured",
+        },
     },
-    "ICON": {
-        "alevel": "modified_sleve_model_level",
-        "alevhalf": "modified_sleve_half_level",
-        "olevel": "depth_coord",
-        "olevhalf": "depth_coord_half",
+    "ICON-XPP": {
+        "vertical": {
+            "alevel": "modified_sleve_model_level",
+            "alevhalf": "modified_sleve_half_level",
+            "olevel": "depth_coord",
+            "olevhalf": "depth_coord_half",
+        },
+        "horizontal": {
+            "default": "unstructured",
+        },
     },
 }
 
@@ -153,19 +164,35 @@ class AICC(BaseNCCheck, BaseCheck):
         tables_path = self.options.get("tables", _DEFAULT_TABLES_PATH)
         self._read_cmip7_tables(tables_path)
 
-        # Load vertical config and resolve the best match for this source_id
+        # Load model config and resolve vertical mapping + grid type for this file
         source_id = _ncattr(dataset, "source_id")
-        vc_opt = self.options.get("vertical_config", None)
-        if vc_opt is None:
-            vertical_config = _DEFAULT_VERTICAL_CONFIG
-        elif isinstance(vc_opt, dict):
-            vertical_config = vc_opt
+        mc_opt = self.options.get("model_config", self.options.get("vertical_config"))
+        if mc_opt is None:
+            model_config = _DEFAULT_CONFIG
+        elif isinstance(mc_opt, dict):
+            model_config = mc_opt
         else:
-            with open(vc_opt) as _f:
-                vertical_config = json.load(_f)
-        self._vert_key, self._vert_mapping = _resolve_vertical_mapping(
-            source_id, vertical_config
-        )
+            with open(mc_opt) as _f:
+                model_config = json.load(_f)
+
+        self._conf_key, model_conf = _resolve_model_config(source_id, model_config)
+        if model_conf:
+            # Support both new format ("vertical"/"horizontal" keys)
+            # and legacy flat format ({"alevel": "...", ...})
+            if "vertical" in model_conf or "horizontal" in model_conf:
+                self._vert_mapping = model_conf.get("vertical") or {}
+                h_conf = model_conf.get("horizontal") or {}
+            else:
+                self._vert_mapping = model_conf
+                h_conf = {}
+            grid_label = _ncattr(dataset, "grid_label")
+            self._grid_type, self._grid_type_known = _resolve_grid_type(h_conf, grid_label)
+            self._grid_label = grid_label
+        else:
+            self._vert_mapping = None
+            self._grid_type = "unstructured"
+            self._grid_type_known = True
+            self._grid_label = _ncattr(dataset, "grid_label")
 
         # Identify variable and its CMOR table entry
         self.branded_variable = _ncattr(dataset, "branded_variable") or None
@@ -279,7 +306,7 @@ class AICC(BaseNCCheck, BaseCheck):
     # ------------------------------------------------------------------
 
     def check_grid(self, ds):
-        """Verify unstructured horizontal grid auxiliary coordinates and vertices."""
+        """Verify horizontal grid coordinates (unstructured or rectilinear)."""
         has_lat = "latitude" in self.requested_dims
         has_lon = "longitude" in self.requested_dims
         if not (has_lat or has_lon):
@@ -287,13 +314,28 @@ class AICC(BaseNCCheck, BaseCheck):
             ctx.add_pass()
             return [ctx.to_result()]
 
-        results = []
-        grid_var_entries = self.CTgrids.get("variable_entry", {})
-
-        # Use cfutil for CF-aware variable discovery
-        aux_coord_names = set(cfutil.get_auxiliary_coordinate_variables(ds))
         lat_vars = cfutil.get_true_latitude_variables(ds)
         lon_vars = cfutil.get_true_longitude_variables(ds)
+
+        if not self._grid_type_known:
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC002] Horizontal grid type")
+            ctx.add_failure(
+                f"grid_label='{self._grid_label}' is not configured for model "
+                f"'{self._conf_key}'. Add it to the 'horizontal' section of "
+                f"'model_config' (e.g. \"{self._grid_label}\": \"unstructured\" "
+                f"or \"rectilinear\")."
+            )
+            return [ctx.to_result()]
+
+        if self._grid_type == "rectilinear":
+            return self._check_rectilinear_grid(ds, lat_vars, lon_vars)
+        return self._check_unstructured_grid(ds, lat_vars, lon_vars)
+
+    def _check_unstructured_grid(self, ds, lat_vars, lon_vars):
+        """Auxiliary lat/lon (1-D cell dim) + vertex bounds."""
+        results = []
+        grid_var_entries = self.CTgrids.get("variable_entry", {})
+        aux_coord_names = set(cfutil.get_auxiliary_coordinate_variables(ds))
 
         for dim_id, cf_vars in (("latitude", lat_vars), ("longitude", lon_vars)):
             if dim_id not in self.requested_dims:
@@ -417,6 +459,104 @@ class AICC(BaseNCCheck, BaseCheck):
 
         return results
 
+    def _check_rectilinear_grid(self, ds, lat_vars, lon_vars):
+        """Dimension coordinate lat(lat)/lon(lon) + regular cell bounds."""
+        results = []
+        axis_entries = self.CTcoords.get("axis_entry", {})
+        dim_coord_names = set(cfutil.get_coordinate_variables(ds))
+        bnds_map = cfutil.get_cell_boundary_map(ds)
+
+        for dim_id, cf_vars, expected_axis in (
+            ("latitude", lat_vars, "Y"),
+            ("longitude", lon_vars, "X"),
+        ):
+            if dim_id not in self.requested_dims:
+                continue
+
+            ce = axis_entries.get(dim_id, {})
+            expected_sn = ce.get("standard_name", dim_id)
+            expected_units = ce.get("units", "")
+            must_have_bounds = ce.get("must_have_bounds", "no") == "yes"
+
+            ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {dim_id} dimension coordinate")
+
+            dim_matches = [v for v in cf_vars if v in dim_coord_names]
+            if not dim_matches:
+                dim_matches = cf_vars
+            if not dim_matches:
+                ctx.add_failure(
+                    f"No {dim_id} coordinate variable found for rectilinear grid."
+                )
+                results.append(ctx.to_result())
+                continue
+            ctx.add_pass()
+
+            var_name = dim_matches[0]
+            var = ds.variables[var_name]
+
+            if var_name not in dim_coord_names:
+                ctx.add_failure(
+                    f"'{var_name}' is not a dimension coordinate; rectilinear "
+                    f"{dim_id} must be a dimension coordinate ({var_name}({var_name}))."
+                )
+            else:
+                ctx.add_pass()
+
+            if _ncattr(var, "axis") != expected_axis:
+                ctx.add_failure(f"'{var_name}' must have axis='{expected_axis}'.")
+            else:
+                ctx.add_pass()
+
+            if _ncattr(var, "standard_name") != expected_sn:
+                ctx.add_failure(
+                    f"'{var_name}' standard_name='{_ncattr(var, 'standard_name')}'; "
+                    f"expected '{expected_sn}'."
+                )
+            else:
+                ctx.add_pass()
+
+            level, msg = _compare_units(_ncattr(var, "units"), expected_units)
+            if level == "fail":
+                ctx.add_failure(f"'{var_name}' units: {msg}")
+            else:
+                ctx.add_pass()
+
+            results.append(ctx.to_result())
+
+            if must_have_bounds:
+                bnds_name = bnds_map.get(var_name) or _ncattr(var, "bounds") or f"{var_name}_bnds"
+                bnds_ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {dim_id} bounds")
+
+                if not _ncattr(var, "bounds"):
+                    bnds_ctx.add_failure(
+                        f"'{var_name}' must have a 'bounds' attribute set to '{bnds_name}'."
+                    )
+                else:
+                    bnds_ctx.add_pass()
+
+                if bnds_name not in ds.variables:
+                    bnds_ctx.add_failure(f"Bounds variable '{bnds_name}' not found.")
+                else:
+                    bnds_ctx.add_pass()
+                    bnds_var = ds.variables[bnds_name]
+                    if bnds_var.ncattrs():
+                        bnds_ctx.add_failure(
+                            f"'{bnds_name}' must have no attributes; "
+                            f"found {list(bnds_var.ncattrs())}."
+                        )
+                    else:
+                        bnds_ctx.add_pass()
+                    if bnds_var.ndim != 2 or bnds_var.shape[1] != 2:
+                        bnds_ctx.add_failure(
+                            f"'{bnds_name}' must have shape (n, 2); "
+                            f"found shape {bnds_var.shape}."
+                        )
+                    else:
+                        bnds_ctx.add_pass()
+                results.append(bnds_ctx.to_result())
+
+        return results
+
     # ------------------------------------------------------------------
 
     def check_vertical(self, ds):
@@ -431,9 +571,9 @@ class AICC(BaseNCCheck, BaseCheck):
             ctx = TestCtx(BaseCheck.HIGH, "[AICC003] Vertical coordinates")
             source_id = _ncattr(ds, "source_id")
             ctx.add_failure(
-                f"source_id '{source_id}' did not match any entry in the vertical "
-                f"coordinate configuration. Add a matching key to 'vertical_config' "
-                f"or pass a custom config via the 'vertical_config' option."
+                f"source_id '{source_id}' did not match any entry in the model "
+                f"configuration. Add a matching key to 'model_config' or pass a "
+                f"custom config via the 'model_config' option."
             )
             return [ctx.to_result()]
 
@@ -450,7 +590,7 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx = TestCtx(BaseCheck.HIGH, f"[AICC003] {generic_id}")
                 ctx.add_failure(
                     f"No vertical coordinate mapping for '{generic_id}' "
-                    f"in config entry '{self._vert_key}'."
+                    f"in config entry '{self._conf_key}'."
                 )
                 results.append(ctx.to_result())
                 continue
@@ -1215,14 +1355,30 @@ def _is_scalar_coord(ce: dict) -> bool:
     return not bool(_as_list(ce.get("requested", [])))
 
 
-def _resolve_vertical_mapping(source_id: str, config: dict) -> tuple:
-    """Return (matched_key, mapping_dict) for the most-specific config entry.
+def _resolve_model_config(source_id: str, config: dict) -> tuple:
+    """Return (matched_key, model_dict) for the most-specific config entry.
 
     All config keys that are substrings of source_id are candidates;
-    the longest match wins (most specific). Returns (None, None) if no key matches.
+    the longest key wins (most specific). Returns (None, None) if no key matches.
     """
     matches = [(k, v) for k, v in config.items() if k in source_id]
     if not matches:
         return None, None
     best_key, best_map = max(matches, key=lambda x: len(x[0]))
     return best_key, best_map
+
+
+def _resolve_grid_type(horizontal_config: dict, grid_label: str) -> tuple:
+    """Return (grid_type, is_known) for the given grid_label.
+
+    is_known is False only when horizontal_config is non-empty and the
+    grid_label is not in it and there is no 'default' key — meaning the
+    caller should report an unknown grid_label issue.
+    """
+    if not horizontal_config:
+        return "unstructured", True          # no config → silent default
+    if grid_label and grid_label in horizontal_config:
+        return horizontal_config[grid_label], True
+    if "default" in horizontal_config:
+        return horizontal_config["default"], True
+    return "unstructured", False             # config present but label not found
