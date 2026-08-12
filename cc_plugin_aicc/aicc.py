@@ -770,9 +770,11 @@ class AICC(BaseNCCheck, BaseCheck):
                     must_have_bounds, is_character, expected_units, bnds_map,
                 )
             else:
+                bounds_values = ce.get("bounds_values", "")
                 _check_scalar_coord(
                     ctx, ds, dim_id, out_name, ce, value, is_character,
                     data_out_name, dim_coord_names, aux_coord_names,
+                    must_have_bounds, bounds_values,
                 )
 
             results.append(ctx.to_result())
@@ -927,7 +929,9 @@ def _decode_char_scalar(var) -> str:
 def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                          ce: dict, value: str, is_character: bool,
                          data_out_name: str,
-                         dim_coord_names: set, aux_coord_names: set):
+                         dim_coord_names: set, aux_coord_names: set,
+                         must_have_bounds: bool = False,
+                         bounds_values: str = ""):
     """Check a scalar coordinate (dimensionless or strlen-only)."""
     # Locate by exact out_name, fall back to standard_name search
     coord_var_name = out_name if out_name in ds.variables else None
@@ -1001,6 +1005,56 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
             )
         else:
             ctx.add_pass()
+
+    # Scalar bounds: must_have_bounds=yes requires a <out_name>_bnds variable
+    if must_have_bounds and not is_character:
+        bnds_name = f"{out_name}_bnds"
+        coord_var = ds.variables.get(coord_var_name)  # may be None if not found above
+        if coord_var is not None:
+            declared_bnds = _ncattr(coord_var, "bounds")
+            if declared_bnds != bnds_name:
+                ctx.add_failure(
+                    f"'{coord_var_name}' bounds='{declared_bnds}'; "
+                    f"expected '{bnds_name}'."
+                )
+            else:
+                ctx.add_pass()
+
+        if bnds_name not in ds.variables:
+            ctx.add_failure(
+                f"Scalar bounds variable '{bnds_name}' for '{out_name}' not found."
+            )
+        else:
+            ctx.add_pass()
+            bnds_var = ds.variables[bnds_name]
+            if bnds_var.ncattrs():
+                ctx.add_failure(
+                    f"'{bnds_name}' must have no attributes; "
+                    f"found: {list(bnds_var.ncattrs())}."
+                )
+            else:
+                ctx.add_pass()
+
+            # Verify the specific bound pair from bounds_values (e.g. "0 100")
+            if bounds_values:
+                try:
+                    parts = bounds_values.split()
+                    expected_lo, expected_hi = float(parts[0]), float(parts[1])
+                    file_bnds = np.asarray(bnds_var[:]).flatten()
+                    actual_lo, actual_hi = float(file_bnds[0]), float(file_bnds[1])
+                    tol = 1e-6 * max(1.0, abs(expected_lo), abs(expected_hi))
+                    if not (np.isclose(actual_lo, expected_lo, atol=tol)
+                            and np.isclose(actual_hi, expected_hi, atol=tol)):
+                        ctx.add_failure(
+                            f"'{bnds_name}' bounds=[{actual_lo}, {actual_hi}]; "
+                            f"expected [{expected_lo}, {expected_hi}]."
+                        )
+                    else:
+                        ctx.add_pass()
+                except Exception as exc:
+                    ctx.add_failure(
+                        f"Could not check bounds_values of '{bnds_name}': {exc}"
+                    )
 
 
 def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
