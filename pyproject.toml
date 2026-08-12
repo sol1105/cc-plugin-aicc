@@ -1,0 +1,77 @@
+[build-system]
+requires = [
+  "setuptools>=42",
+  "wheel",
+  "setuptools_scm[toml]>=3.4"
+]
+
+[project]
+name = "cc-plugin-aicc"
+description = "Compliance Checker plugin for CMIP7 coordinate checks on AWI/ICON unstructured model output"
+readme = "README.md"
+keywords = ["compliance checker", "plugin", "cmip7", "awi", "icon", "coordinates"]
+license = {file = "LICENSE"}
+authors = [
+  {name = "Martin Schupfner", email = "schupfner@dkrz.de"}
+]
+maintainers = [
+  {name = "Martin Schupfner", email = "schupfner@dkrz.de"}
+]
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13"
+]
+dependencies = [
+  "cftime",
+  "compliance-checker>=5.1.2",
+  "netCDF4",
+  "numpy",
+  "xarray"
+]
+dynamic = [
+  "version"
+]
+
+[project.entry-points."compliance_checker.suites"]
+aicc = "cc_plugin_aicc.aicc:AICC"
+
+[project.urls]
+repository = "https://github.com/euro-cordex/cc-plugin-aicc"
+
+[project.optional-dependencies]
+dev = [
+  "black",
+  "isort",
+  "flake8",
+  "pytest>=7.0.0",
+  "ruff>=0.1.0"
+]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0"
+write_to = "cc_plugin_aicc/_version.py"
+
+[tool.black]
+target-version = ["py310", "py311", "py312", "py313"]
+
+[tool.ruff]
+src = ["cc_plugin_aicc"]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.format]
+line-ending = "auto"
+
+[tool.ruff.isort]
+known-first-party = ["cc_plugin_aicc"]
+lines-after-imports = 1
+
+[tool.pytest.ini_options]
+filterwarnings = [
+  "ignore::UserWarning",
+  "ignore::RuntimeWarning"
+]
