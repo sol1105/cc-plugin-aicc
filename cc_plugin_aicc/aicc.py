@@ -882,6 +882,42 @@ def _check_formula_var_attrs(ctx: TestCtx, var, var_name: str, ft_entry: dict):
             ctx.add_pass()
 
 
+def _check_coord_attrs(ctx: TestCtx, var, var_name: str, ce: dict):
+    """Check standard_name and long_name of a coordinate variable against the table."""
+    expected_sn = ce.get("standard_name", "")
+    if expected_sn:
+        actual_sn = _ncattr(var, "standard_name")
+        if actual_sn != expected_sn:
+            ctx.add_failure(
+                f"'{var_name}' standard_name='{actual_sn}'; expected '{expected_sn}'."
+            )
+        else:
+            ctx.add_pass()
+
+    expected_ln = ce.get("long_name", "")
+    if expected_ln:
+        actual_ln = _ncattr(var, "long_name")
+        if actual_ln != expected_ln:
+            ctx.add_failure(
+                f"'{var_name}' long_name='{actual_ln}'; expected '{expected_ln}'."
+            )
+        else:
+            ctx.add_pass()
+
+
+def _decode_char_scalar(var) -> str:
+    """Decode a netCDF4 character-array scalar variable to a plain string."""
+    import netCDF4 as nc4
+    try:
+        return nc4.chartostring(var[:])[()].decode("utf-8").rstrip("\x00").strip()
+    except Exception:
+        pass
+    try:
+        return b"".join(bytes(c) for c in var[:]).decode("utf-8").rstrip("\x00").strip()
+    except Exception:
+        return ""
+
+
 def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                          ce: dict, value: str, is_character: bool,
                          data_out_name: str,
@@ -905,6 +941,9 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
 
     coord_var = ds.variables[coord_var_name]
 
+    # Verify standard_name and long_name against the table
+    _check_coord_attrs(ctx, coord_var, coord_var_name, ce)
+
     if is_character:
         dims = list(coord_var.dimensions)
         if dims != ["strlen"]:
@@ -914,6 +953,15 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
             )
         else:
             ctx.add_pass()
+        # Verify the string value matches the table entry
+        if value:
+            actual_str = _decode_char_scalar(coord_var)
+            if actual_str != value:
+                ctx.add_failure(
+                    f"'{coord_var_name}' value='{actual_str}'; expected '{value}'."
+                )
+            else:
+                ctx.add_pass()
     else:
         if coord_var.ndim != 0:
             ctx.add_failure(
@@ -970,6 +1018,9 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
     ctx.add_pass()
 
     coord_var = ds.variables[coord_var_name]
+
+    # Verify standard_name and long_name against the table
+    _check_coord_attrs(ctx, coord_var, coord_var_name, ce)
 
     if is_character:
         # Dims must be (out_name, strlen)
