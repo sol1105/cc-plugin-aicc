@@ -1,17 +1,15 @@
 """
 aicc.py — AWI ICON Coordinate Checker (AICC) / AI Compliance Checker
 
-Verifies CMIP7 coordinate compliance for AWI and ICON model output
-with unstructured horizontal grids.
+Verifies CMIP7 coordinate compliance for AWI and ICON model output.
 
-Variable discovery delegates entirely to compliance_checker.cf.util (cfutil)
-so that CF conventions are applied consistently across the whole checker
-ecosystem rather than being re-implemented here.
+Variable discovery delegates to compliance_checker.cf.util (cfutil) for
+consistent CF-convention application. Configuration lives in config.py;
+pure utility functions live in utils.py.
 """
 
 import json
 import os
-import re
 from pathlib import Path
 
 import numpy as np
@@ -19,114 +17,27 @@ from compliance_checker.base import BaseCheck, BaseNCCheck, Result, TestCtx
 from compliance_checker.cf import util as cfutil
 
 from cc_plugin_aicc import __version__
-
-# ---------------------------------------------------------------------------
-# Module-level constants
-# ---------------------------------------------------------------------------
-
-# Default CMIP7 tables path: honour env var, fall back to a sibling checkout.
-# Override at runtime via the 'tables' checker option.
-_DEFAULT_TABLES_PATH = os.environ.get(
-    "CMIP7_TABLES_PATH",
-    str(Path(__file__).resolve().parent.parent.parent / "cmip7-cmor-tables" / "tables"),
+from cc_plugin_aicc.config import (
+    DEFAULT_TABLES_PATH,
+    HORIZONTAL_DIM_IDS,
+    REALM_TO_TABLE,
+    VERTICAL_GENERIC_IDS,
+    load_model_config,
+    resolve_grid_type,
+    resolve_model_config,
 )
-
-# Per-model configuration: source_id_substring -> {"vertical": {...}, "horizontal": {...}}
-# Longer (more-specific) source_id keys take precedence.
-# Pass a custom dict or path to a JSON file via the 'model_config' checker option.
-_DEFAULT_CONFIG = {
-    "AWI-ESM": {
-        "vertical": {
-            "alevel": "alternate_hybrid_sigma",
-            "alevhalf": "alternate_hybrid_sigma_half",
-            "olevel": "depth_coord",
-            "olevhalf": "depth_coord_half",
-        },
-        "horizontal": {
-            "default": "unstructured",
-            "g122": "unstructured",
-        },
-    },
-    "ICON-XPP": {
-        "vertical": {
-            "alevel": "modified_sleve_model_level",
-            "alevhalf": "modified_sleve_half_level",
-            "olevel": "depth_coord",
-            "olevhalf": "depth_coord_half",
-        },
-        "horizontal": {
-            "default": "unstructured",
-        },
-    },
-}
-
-_VERTICAL_GENERIC_IDS = frozenset({"alevel", "alevhalf", "olevel", "olevhalf"})
-_HORIZONTAL_DIM_IDS = frozenset({"latitude", "longitude"})
-
-# First word of the realm global attribute → CMIP7 table name fragment
-_REALM_TO_TABLE = {
-    "atmos": "atmos",
-    "land": "land",
-    "ocean": "ocean",
-    "seaIce": "seaIce",
-    "landIce": "landIce",
-    "aerosol": "aerosol",
-    "atmosChem": "atmosChem",
-    "ocnBgchem": "ocnBgchem",
-}
-
-
-def _is_time_dim(dim_id: str) -> bool:
-    return dim_id.startswith("time")
-
-
-# Adapted from swarnaleem's attr() — github.com/swarnaleem/cc-plugin-wcrp feature/coordinate-standard db0791d plugins/coordinate_standard/classify.py
-def _ncattr(var_or_ds, name: str, default=""):
-    """Safe attribute read for both netCDF4 variables and Datasets."""
-    return getattr(var_or_ds, name, default) or default
-
-
-# Adapted from swarnaleem's neutral_dtype() — github.com/swarnaleem/cc-plugin-wcrp feature/coordinate-standard db0791d plugins/coordinate_standard/classify.py
-def _neutral_dtype(var) -> str:
-    """Return 'character', 'integer', or 'double' for a netCDF4 variable."""
-    kind = getattr(getattr(var, "dtype", None), "kind", "")
-    if kind in ("S", "U"):
-        return "character"
-    if kind in ("i", "u"):
-        return "integer"
-    return "double"
-
-
-# Adapted from swarnaleem's _compare_units() — github.com/swarnaleem/cc-plugin-wcrp feature/coordinate-standard db0791d plugins/coordinate_standard/matching.py
-def _compare_units(candidate_units: str, entry_units: str) -> tuple:
-    """Tiered units comparison backed by udunits.
-
-    Returns (level, message): 'ok', 'warn' (convertible but not identical),
-    or 'fail'. CMOR time templates like 'days since ?' accept any date.
-    """
-    if not entry_units:
-        return "ok", ""
-    if not candidate_units:
-        return "warn", f"units missing; table expects '{entry_units}'"
-    if candidate_units == entry_units:
-        return "ok", ""
-    if "?" in entry_units:
-        pattern = re.escape(entry_units).replace(r"\?", ".+")
-        if re.fullmatch(pattern, candidate_units):
-            return "ok", ""
-        if " since " in entry_units and " since " in candidate_units:
-            entry_base = entry_units.split(" since ")[0]
-            cand_base = candidate_units.split(" since ")[0]
-            if cfutil.units_convertible(cand_base, entry_base):
-                return "warn", (f"units '{candidate_units}' use base unit "
-                                f"'{cand_base}'; table expects '{entry_base}'")
-        return "fail", (f"units '{candidate_units}' do not match the table "
-                        f"template '{entry_units}'")
-    if cfutil.units_convertible(candidate_units, entry_units):
-        return "warn", (f"units '{candidate_units}' convertible to but not "
-                        f"identical to table units '{entry_units}'")
-    return "fail", f"units '{candidate_units}' not convertible to '{entry_units}'"
-
+from cc_plugin_aicc.utils import (
+    _as_list,
+    _compare_units,
+    _decode_char_scalar,
+    _decode_char_var,
+    _find_formula_entry,
+    _is_scalar_coord,
+    _is_time_dim,
+    _ncattr,
+    _neutral_dtype,
+    _parse_formula_terms,
+)
 
 # ---------------------------------------------------------------------------
 # Plugin class
@@ -161,21 +72,15 @@ class AICC(BaseNCCheck, BaseCheck):
         self.ds = dataset  # netCDF4.Dataset — used by all check methods
 
         # Read CMIP7 CMOR tables
-        tables_path = self.options.get("tables", _DEFAULT_TABLES_PATH)
+        tables_path = self.options.get("tables", DEFAULT_TABLES_PATH)
         self._read_cmip7_tables(tables_path)
 
         # Load model config and resolve vertical mapping + grid type for this file
         source_id = _ncattr(dataset, "source_id")
         mc_opt = self.options.get("model_config", self.options.get("vertical_config"))
-        if mc_opt is None:
-            model_config = _DEFAULT_CONFIG
-        elif isinstance(mc_opt, dict):
-            model_config = mc_opt
-        else:
-            with open(mc_opt) as _f:
-                model_config = json.load(_f)
+        model_config = load_model_config(mc_opt)
 
-        self._conf_key, model_conf = _resolve_model_config(source_id, model_config)
+        self._conf_key, model_conf = resolve_model_config(source_id, model_config)
         if model_conf:
             # Support both new format ("vertical"/"horizontal" keys)
             # and legacy flat format ({"alevel": "...", ...})
@@ -186,7 +91,7 @@ class AICC(BaseNCCheck, BaseCheck):
                 self._vert_mapping = model_conf
                 h_conf = {}
             grid_label = _ncattr(dataset, "grid_label")
-            self._grid_type, self._grid_type_known = _resolve_grid_type(h_conf, grid_label)
+            self._grid_type, self._grid_type_known = resolve_grid_type(h_conf, grid_label)
             self._grid_label = grid_label
         else:
             self._vert_mapping = None
@@ -267,7 +172,7 @@ class AICC(BaseNCCheck, BaseCheck):
         else:
             realm_raw = _ncattr(ds, "realm")
             realm_first = realm_raw.split()[0] if realm_raw else ""
-            mapped = _REALM_TO_TABLE.get(realm_first)
+            mapped = REALM_TO_TABLE.get(realm_first)
             candidates = [mapped] if mapped and mapped in self.CT else list(self.CT)
 
         for tname in candidates:
@@ -999,18 +904,8 @@ class AICC(BaseNCCheck, BaseCheck):
 # ---------------------------------------------------------------------------
 
 
-def _parse_formula_terms(ft_str: str) -> dict:
-    """Parse 'ap: ap b: b ps: ps' style formula_terms string."""
-    return {m.group(1): m.group(2) for m in re.finditer(r"(\w+)\s*:\s*(\w+)", ft_str)}
 
 
-def _find_formula_entry(formula_entries: dict, var_name: str, generic_id: str) -> dict:
-    """Return the formula_terms table entry whose out_name and dimension match."""
-    for entry in formula_entries.values():
-        if (entry.get("out_name") == var_name
-                and generic_id in entry.get("dimensions", "")):
-            return entry
-    return {}
 
 
 def _check_formula_var_attrs(ctx: TestCtx, var, var_name: str, ft_entry: dict):
@@ -1056,23 +951,9 @@ def _check_coord_attrs(ctx: TestCtx, var, var_name: str, ce: dict):
             ctx.add_pass()
 
 
-def _decode_char_var(var) -> list:
-    """Decode a netCDF4 char(n, strlen) or char(strlen) variable to a list of strings."""
-    raw = np.asarray(var[:])
-    if raw.ndim == 1:
-        # scalar: shape (strlen,) — one string
-        return [raw.tobytes().decode("utf-8", errors="replace").rstrip("\x00").strip()]
-    # dimension coordinate: shape (n, strlen) — n strings
-    return [
-        raw[i].tobytes().decode("utf-8", errors="replace").rstrip("\x00").strip()
-        for i in range(raw.shape[0])
-    ]
 
 
 # kept for scalar-only callers
-def _decode_char_scalar(var) -> str:
-    """Decode a netCDF4 char(strlen) variable to a plain string."""
-    return _decode_char_var(var)[0]
 
 
 def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
@@ -1341,44 +1222,9 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                         )
 
 
-def _as_list(val) -> list:
-    """Normalise a CMIP7 table 'requested' / 'requested_bounds' field to a list."""
-    if not val:
-        return []
-    if isinstance(val, list):
-        return [v for v in val if v != ""]
-    return [val] if isinstance(val, str) and val else list(val)
 
 
-def _is_scalar_coord(ce: dict) -> bool:
-    """True if the coordinate entry represents a scalar (no multi-value list)."""
-    return not bool(_as_list(ce.get("requested", [])))
 
 
-def _resolve_model_config(source_id: str, config: dict) -> tuple:
-    """Return (matched_key, model_dict) for the most-specific config entry.
-
-    All config keys that are substrings of source_id are candidates;
-    the longest key wins (most specific). Returns (None, None) if no key matches.
-    """
-    matches = [(k, v) for k, v in config.items() if k in source_id]
-    if not matches:
-        return None, None
-    best_key, best_map = max(matches, key=lambda x: len(x[0]))
-    return best_key, best_map
 
 
-def _resolve_grid_type(horizontal_config: dict, grid_label: str) -> tuple:
-    """Return (grid_type, is_known) for the given grid_label.
-
-    is_known is False only when horizontal_config is non-empty and the
-    grid_label is not in it and there is no 'default' key — meaning the
-    caller should report an unknown grid_label issue.
-    """
-    if not horizontal_config:
-        return "unstructured", True          # no config → silent default
-    if grid_label and grid_label in horizontal_config:
-        return horizontal_config[grid_label], True
-    if "default" in horizontal_config:
-        return horizontal_config["default"], True
-    return "unstructured", False             # config present but label not found
