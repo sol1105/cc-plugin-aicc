@@ -28,6 +28,7 @@ from cc_plugin_aicc.config import (
 )
 from cc_plugin_aicc.utils import (
     _as_list,
+    _cmor_tol_val,
     _compare_units,
     _decode_char_scalar,
     _decode_char_var,
@@ -819,19 +820,20 @@ class AICC(BaseNCCheck, BaseCheck):
             is_multi = bool(requested)
 
             if is_multi:
-                _check_multi_value_coord(
+                low = _check_multi_value_coord(
                     ctx, ds, out_name, ce, requested, requested_bounds,
                     must_have_bounds, is_character, expected_units, bnds_map,
                 )
             else:
                 bounds_values = ce.get("bounds_values", "")
-                _check_scalar_coord(
+                low = _check_scalar_coord(
                     ctx, ds, dim_id, out_name, ce, value, is_character,
                     data_out_name, dim_coord_names, aux_coord_names,
                     must_have_bounds, bounds_values,
                 )
 
             results.append(ctx.to_result())
+            results.extend(low)
 
         return results
 
@@ -961,8 +963,11 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                          data_out_name: str,
                          dim_coord_names: set, aux_coord_names: set,
                          must_have_bounds: bool = False,
-                         bounds_values: str = ""):
-    """Check a scalar coordinate (dimensionless or strlen-only)."""
+                         bounds_values: str = "") -> list:
+    """Check a scalar coordinate. Returns list[Result] for LOW advisories."""
+    low_ctx = TestCtx(BaseCheck.LOW, f"[AICC005] Coordinate '{out_name}' (advisory)")
+    low_findings: list = []
+
     # Locate by exact out_name, fall back to standard_name search
     coord_var_name = out_name if out_name in ds.variables else None
     if coord_var_name is None:
@@ -976,12 +981,10 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
         ctx.add_failure(
             f"Scalar coordinate '{out_name}' (dim_id='{dim_id}') not found in file."
         )
-        return
+        return low_findings
     ctx.add_pass()
 
     coord_var = ds.variables[coord_var_name]
-
-    # Verify standard_name and long_name against the table
     _check_coord_attrs(ctx, coord_var, coord_var_name, ce)
 
     if is_character:
@@ -993,7 +996,6 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
             )
         else:
             ctx.add_pass()
-        # Verify the string value matches the table entry
         if value:
             actual_str = _decode_char_scalar(coord_var)
             if actual_str != value:
@@ -1013,13 +1015,32 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
             if value:
                 try:
                     actual = float(np.asarray(coord_var[...]).flat[0])
-                    if not np.isclose(actual, float(value), rtol=1e-5, atol=0):
-                        ctx.add_failure(
-                            f"Scalar coordinate '{coord_var_name}' value={actual}; "
-                            f"expected {float(value)}."
-                        )
-                    else:
+                    expected_val = float(value)
+                    if actual == expected_val:
                         ctx.add_pass()
+                    else:
+                        valid_min_s = ce.get("valid_min", "")
+                        valid_max_s = ce.get("valid_max", "")
+                        if valid_min_s and valid_max_s:
+                            vmin, vmax = float(valid_min_s), float(valid_max_s)
+                            if vmin <= actual <= vmax:
+                                # Within valid range: advisory only
+                                ctx.add_pass()
+                                low_ctx.add_failure(
+                                    f"'{coord_var_name}' value={actual} differs from "
+                                    f"expected {expected_val} but is within valid range "
+                                    f"[{vmin}, {vmax}]."
+                                )
+                                low_findings = [low_ctx.to_result()]
+                            else:
+                                ctx.add_failure(
+                                    f"'{coord_var_name}' value={actual}; expected "
+                                    f"{expected_val} (valid range [{vmin}, {vmax}])."
+                                )
+                        else:
+                            ctx.add_failure(
+                                f"'{coord_var_name}' value={actual}; expected {expected_val}."
+                            )
                 except (TypeError, ValueError):
                     ctx.add_pass()
 
@@ -1036,16 +1057,15 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
         else:
             ctx.add_pass()
 
-    # Scalar bounds: must_have_bounds=yes requires a <out_name>_bnds variable
+    # Scalar bounds
     if must_have_bounds and not is_character:
         bnds_name = f"{out_name}_bnds"
-        coord_var = ds.variables.get(coord_var_name)  # may be None if not found above
-        if coord_var is not None:
-            declared_bnds = _ncattr(coord_var, "bounds")
+        coord_var_ref = ds.variables.get(coord_var_name)
+        if coord_var_ref is not None:
+            declared_bnds = _ncattr(coord_var_ref, "bounds")
             if declared_bnds != bnds_name:
                 ctx.add_failure(
-                    f"'{coord_var_name}' bounds='{declared_bnds}'; "
-                    f"expected '{bnds_name}'."
+                    f"'{coord_var_name}' bounds='{declared_bnds}'; expected '{bnds_name}'."
                 )
             else:
                 ctx.add_pass()
@@ -1065,33 +1085,57 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
             else:
                 ctx.add_pass()
 
-            # Verify the specific bound pair from bounds_values (e.g. "0 100")
-            if bounds_values:
+            if bounds_values and value:
                 try:
                     parts = bounds_values.split()
-                    expected_lo, expected_hi = float(parts[0]), float(parts[1])
+                    exp_lo, exp_hi = float(parts[0]), float(parts[1])
                     file_bnds = np.asarray(bnds_var[:]).flatten()
-                    actual_lo, actual_hi = float(file_bnds[0]), float(file_bnds[1])
-                    tol = 1e-6 * max(1.0, abs(expected_lo), abs(expected_hi))
-                    if not (np.isclose(actual_lo, expected_lo, atol=tol)
-                            and np.isclose(actual_hi, expected_hi, atol=tol)):
-                        ctx.add_failure(
-                            f"'{bnds_name}' bounds=[{actual_lo}, {actual_hi}]; "
-                            f"expected [{expected_lo}, {expected_hi}]."
-                        )
+                    act_lo, act_hi = float(file_bnds[0]), float(file_bnds[1])
+
+                    tol_str = ce.get("tolerance", "")
+                    if tol_str:
+                        # CMOR tolerance for scalar (i=0, one value)
+                        scalar_val = float(value)
+                        tol = _cmor_tol_val(0, [scalar_val], [(exp_lo, exp_hi)], float(tol_str))
+                        lo_diff = abs(act_lo - exp_lo)
+                        hi_diff = abs(act_hi - exp_hi)
+                        if lo_diff > tol or hi_diff > tol:
+                            ctx.add_failure(
+                                f"'{bnds_name}' bounds=[{act_lo}, {act_hi}] outside "
+                                f"tolerance {tol:.3g} of expected [{exp_lo}, {exp_hi}]."
+                            )
+                        else:
+                            ctx.add_pass()
+                            if lo_diff > 0 or hi_diff > 0:
+                                low_ctx.add_failure(
+                                    f"'{bnds_name}' bounds=[{act_lo}, {act_hi}] within "
+                                    f"tolerance but not exact; expected [{exp_lo}, {exp_hi}]."
+                                )
+                                low_findings = [low_ctx.to_result()]
                     else:
-                        ctx.add_pass()
+                        default_tol = 1e-6 * max(1.0, abs(exp_lo), abs(exp_hi))
+                        if not (np.isclose(act_lo, exp_lo, atol=default_tol)
+                                and np.isclose(act_hi, exp_hi, atol=default_tol)):
+                            ctx.add_failure(
+                                f"'{bnds_name}' bounds=[{act_lo}, {act_hi}]; "
+                                f"expected [{exp_lo}, {exp_hi}]."
+                            )
+                        else:
+                            ctx.add_pass()
                 except Exception as exc:
-                    ctx.add_failure(
-                        f"Could not check bounds_values of '{bnds_name}': {exc}"
-                    )
+                    ctx.add_failure(f"Could not check bounds_values of '{bnds_name}': {exc}")
+
+    return low_findings
 
 
 def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                               requested: list, requested_bounds: list,
                               must_have_bounds: bool, is_character: bool,
-                              expected_units: str, bnds_map: dict):
-    """Check a multi-value coordinate (requested values must be present in file)."""
+                              expected_units: str, bnds_map: dict) -> list:
+    """Check a multi-value coordinate. Returns list[Result] for LOW advisories."""
+    low_ctx = TestCtx(BaseCheck.LOW, f"[AICC005] Coordinate '{out_name}' (advisory)")
+    low_findings: list = []
+
     coord_var_name = out_name if out_name in ds.variables else None
     if coord_var_name is None:
         sn = ce.get("standard_name", "")
@@ -1138,7 +1182,7 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                 )
     else:
         tol_str = ce.get("tolerance", "")
-        tol = float(tol_str) if tol_str else 1e-6
+        tol_factor = float(tol_str) if tol_str else None
 
         # units via udunits
         if expected_units:
@@ -1148,26 +1192,47 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
             else:
                 ctx.add_pass()
 
+        # Build requested bound pairs aligned with requested values (for tol calc)
+        req_floats = [float(r) for r in requested] if requested else []
+        req_pairs: list = []
+        if requested_bounds:
+            req_pairs = list(zip(
+                [float(requested_bounds[i]) for i in range(0, len(requested_bounds), 2)],
+                [float(requested_bounds[i]) for i in range(1, len(requested_bounds), 2)],
+            ))
+
         if requested:
             try:
-                file_vals = list(np.asarray(coord_var[:]).flat)
-                req_floats = [float(r) for r in requested]
-                missing = [
-                    r for r in req_floats
-                    if not any(abs(r - fv) <= tol for fv in file_vals)
-                ]
-                if missing:
+                file_vals = np.asarray(coord_var[:]).flatten()
+                outside_tol, within_tol_not_exact = [], []
+                for i, rv in enumerate(req_floats):
+                    if tol_factor is not None:
+                        tol = _cmor_tol_val(i, req_floats, req_pairs, tol_factor)
+                        matches_tol = [fv for fv in file_vals if abs(rv - fv) <= tol]
+                        if not matches_tol:
+                            outside_tol.append(rv)
+                        elif not any(fv == rv for fv in file_vals):
+                            within_tol_not_exact.append(rv)
+                    else:
+                        if not any(fv == rv for fv in file_vals):
+                            outside_tol.append(rv)
+                if outside_tol:
                     ctx.add_failure(
-                        f"'{coord_var_name}' missing requested value(s) "
-                        f"{missing} (tolerance={tol})."
+                        f"'{coord_var_name}' missing requested value(s) {outside_tol}"
+                        + (f" (outside tolerance, factor={tol_factor})." if tol_factor else ".")
                     )
                 else:
                     ctx.add_pass()
+                if within_tol_not_exact:
+                    low_ctx.add_failure(
+                        f"'{coord_var_name}' value(s) {within_tol_not_exact} match "
+                        f"within tolerance (factor={tol_factor}) but not exactly."
+                    )
+                    low_findings = [low_ctx.to_result()]
             except Exception as exc:
                 ctx.add_failure(f"Could not check values of '{coord_var_name}': {exc}")
 
         if must_have_bounds:
-            # cfutil-derived bounds map takes precedence
             bnds_name = (bnds_map.get(coord_var_name)
                          or _ncattr(coord_var, "bounds")
                          or f"{coord_var_name}_bnds")
@@ -1195,31 +1260,41 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                 else:
                     ctx.add_pass()
 
-                if requested_bounds:
+                if req_pairs:
                     try:
                         file_bnds = np.asarray(bnds_var[:]).reshape(-1, 2)
-                        req_pairs = list(zip(
-                            [float(requested_bounds[i]) for i in range(0, len(requested_bounds), 2)],
-                            [float(requested_bounds[i]) for i in range(1, len(requested_bounds), 2)],
-                        ))
-                        missing_pairs = [
-                            pair for pair in req_pairs
-                            if not any(
-                                abs(pair[0] - fb[0]) <= tol and abs(pair[1] - fb[1]) <= tol
-                                for fb in file_bnds
-                            )
-                        ]
-                        if missing_pairs:
+                        outside_tol_bnds, within_tol_bnds = [], []
+                        for i, (exp_lo, exp_hi) in enumerate(req_pairs):
+                            if tol_factor is not None:
+                                tol = _cmor_tol_val(i, req_floats, req_pairs, tol_factor)
+                                matches = [fb for fb in file_bnds
+                                           if abs(fb[0] - exp_lo) <= tol and abs(fb[1] - exp_hi) <= tol]
+                                if not matches:
+                                    outside_tol_bnds.append((exp_lo, exp_hi))
+                                elif not any(fb[0] == exp_lo and fb[1] == exp_hi for fb in file_bnds):
+                                    within_tol_bnds.append((exp_lo, exp_hi))
+                            else:
+                                if not any(fb[0] == exp_lo and fb[1] == exp_hi for fb in file_bnds):
+                                    outside_tol_bnds.append((exp_lo, exp_hi))
+                        if outside_tol_bnds:
                             ctx.add_failure(
-                                f"'{bnds_name}' missing requested bound pair(s) "
-                                f"{missing_pairs} (tolerance={tol})."
+                                f"'{bnds_name}' missing requested bound pair(s) {outside_tol_bnds}"
+                                + (f" (outside tolerance, factor={tol_factor})." if tol_factor else ".")
                             )
                         else:
                             ctx.add_pass()
+                        if within_tol_bnds:
+                            low_ctx.add_failure(
+                                f"'{bnds_name}' bound pair(s) {within_tol_bnds} match "
+                                f"within tolerance (factor={tol_factor}) but not exactly."
+                            )
+                            low_findings = [low_ctx.to_result()]
                     except Exception as exc:
                         ctx.add_failure(
                             f"Could not check bounds of '{coord_var_name}': {exc}"
                         )
+
+    return low_findings
 
 
 

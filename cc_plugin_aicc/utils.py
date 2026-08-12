@@ -108,3 +108,18 @@ def _find_formula_entry(formula_entries: dict, var_name: str, generic_id: str) -
                 and generic_id in entry.get("dimensions", "")):
             return entry
     return {}
+
+
+def _cmor_tol_val(i: int, req_vals: list, bound_pairs: list, tolerance: float) -> float:
+    """Compute the per-element CMOR tolerance as defined in the CMIP7 coordinate CV.
+
+    tolerance is the raw float from the table entry (already validated > 0).
+    bound_pairs is a list of (lo, hi) tuples aligned with req_vals, or empty.
+    """
+    tol = 0.001 * tolerance * abs(req_vals[i])
+    if i > 0:
+        tol = min(tol, 0.001 * tolerance * abs(req_vals[i] - req_vals[i - 1]))
+    if bound_pairs and i < len(bound_pairs):
+        lo, hi = bound_pairs[i]
+        tol = min(tol, 0.001 * tolerance * abs(hi - lo))
+    return tol
