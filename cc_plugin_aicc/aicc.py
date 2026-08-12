@@ -905,17 +905,23 @@ def _check_coord_attrs(ctx: TestCtx, var, var_name: str, ce: dict):
             ctx.add_pass()
 
 
+def _decode_char_var(var) -> list:
+    """Decode a netCDF4 char(n, strlen) or char(strlen) variable to a list of strings."""
+    raw = np.asarray(var[:])
+    if raw.ndim == 1:
+        # scalar: shape (strlen,) — one string
+        return [raw.tobytes().decode("utf-8", errors="replace").rstrip("\x00").strip()]
+    # dimension coordinate: shape (n, strlen) — n strings
+    return [
+        raw[i].tobytes().decode("utf-8", errors="replace").rstrip("\x00").strip()
+        for i in range(raw.shape[0])
+    ]
+
+
+# kept for scalar-only callers
 def _decode_char_scalar(var) -> str:
-    """Decode a netCDF4 character-array scalar variable to a plain string."""
-    import netCDF4 as nc4
-    try:
-        return nc4.chartostring(var[:])[()].decode("utf-8").rstrip("\x00").strip()
-    except Exception:
-        pass
-    try:
-        return b"".join(bytes(c) for c in var[:]).decode("utf-8").rstrip("\x00").strip()
-    except Exception:
-        return ""
+    """Decode a netCDF4 char(strlen) variable to a plain string."""
+    return _decode_char_var(var)[0]
 
 
 def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
@@ -1002,8 +1008,6 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                               must_have_bounds: bool, is_character: bool,
                               expected_units: str, bnds_map: dict):
     """Check a multi-value coordinate (requested values must be present in file)."""
-    import netCDF4 as nc4
-
     coord_var_name = out_name if out_name in ds.variables else None
     if coord_var_name is None:
         sn = ce.get("standard_name", "")
@@ -1035,8 +1039,7 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
 
         if requested:
             try:
-                vals = [v.rstrip("\x00").strip()
-                        for v in nc4.chartostring(coord_var[:])]
+                vals = _decode_char_var(coord_var)
                 missing = [r for r in requested if r not in vals]
                 if missing:
                     ctx.add_failure(
