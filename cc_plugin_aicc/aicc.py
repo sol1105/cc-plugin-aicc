@@ -31,8 +31,10 @@ _DEFAULT_TABLES_PATH = os.environ.get(
     str(Path(__file__).resolve().parent.parent.parent / "cmip7-cmor-tables" / "tables"),
 )
 
-# Generic vertical level dimension_id → specific coordinate-table entry name
-_VERTICAL_MAPPING = {
+# Default vertical coordinate mapping: source_id_substring -> {generic_id: coord_entry_name}
+# Longer (more-specific) keys take precedence over shorter ones.
+# Pass a custom dict or path to a JSON file via the 'vertical_config' checker option.
+_DEFAULT_VERTICAL_CONFIG = {
     "AWI": {
         "alevel": "alternate_hybrid_sigma",
         "alevhalf": "alternate_hybrid_sigma_half",
@@ -151,14 +153,19 @@ class AICC(BaseNCCheck, BaseCheck):
         tables_path = self.options.get("tables", _DEFAULT_TABLES_PATH)
         self._read_cmip7_tables(tables_path)
 
-        # Determine model type from source_id global attribute
+        # Load vertical config and resolve the best match for this source_id
         source_id = _ncattr(dataset, "source_id")
-        if "AWI" in source_id:
-            self.model_type = "AWI"
-        elif "ICON" in source_id:
-            self.model_type = "ICON"
+        vc_opt = self.options.get("vertical_config", None)
+        if vc_opt is None:
+            vertical_config = _DEFAULT_VERTICAL_CONFIG
+        elif isinstance(vc_opt, dict):
+            vertical_config = vc_opt
         else:
-            self.model_type = None
+            with open(vc_opt) as _f:
+                vertical_config = json.load(_f)
+        self._vert_key, self._vert_mapping = _resolve_vertical_mapping(
+            source_id, vertical_config
+        )
 
         # Identify variable and its CMOR table entry
         self.branded_variable = _ncattr(dataset, "branded_variable") or None
@@ -420,11 +427,13 @@ class AICC(BaseNCCheck, BaseCheck):
             ctx.add_pass()
             return [ctx.to_result()]
 
-        if self.model_type is None:
+        if self._vert_mapping is None:
             ctx = TestCtx(BaseCheck.HIGH, "[AICC003] Vertical coordinates")
+            source_id = _ncattr(ds, "source_id")
             ctx.add_failure(
-                "source_id contains neither 'AWI' nor 'ICON'; "
-                "cannot resolve generic vertical coordinate mapping."
+                f"source_id '{source_id}' did not match any entry in the vertical "
+                f"coordinate configuration. Add a matching key to 'vertical_config' "
+                f"or pass a custom config via the 'vertical_config' option."
             )
             return [ctx.to_result()]
 
@@ -436,12 +445,12 @@ class AICC(BaseNCCheck, BaseCheck):
         z_var_names = set(cfutil.get_z_variables(ds))
 
         for generic_id in vert_dims:
-            coord_key = _VERTICAL_MAPPING[self.model_type].get(generic_id)
+            coord_key = self._vert_mapping.get(generic_id)
             if not coord_key:
                 ctx = TestCtx(BaseCheck.HIGH, f"[AICC003] {generic_id}")
                 ctx.add_failure(
                     f"No vertical coordinate mapping for '{generic_id}' "
-                    f"and model_type='{self.model_type}'."
+                    f"in config entry '{self._vert_key}'."
                 )
                 results.append(ctx.to_result())
                 continue
@@ -1204,3 +1213,16 @@ def _as_list(val) -> list:
 def _is_scalar_coord(ce: dict) -> bool:
     """True if the coordinate entry represents a scalar (no multi-value list)."""
     return not bool(_as_list(ce.get("requested", [])))
+
+
+def _resolve_vertical_mapping(source_id: str, config: dict) -> tuple:
+    """Return (matched_key, mapping_dict) for the most-specific config entry.
+
+    All config keys that are substrings of source_id are candidates;
+    the longest match wins (most specific). Returns (None, None) if no key matches.
+    """
+    matches = [(k, v) for k, v in config.items() if k in source_id]
+    if not matches:
+        return None, None
+    best_key, best_map = max(matches, key=lambda x: len(x[0]))
+    return best_key, best_map
