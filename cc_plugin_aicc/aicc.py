@@ -466,7 +466,7 @@ class AICC(BaseNCCheck, BaseCheck):
 
     def check_vertical(self, ds):
         """Verify vertical coordinate(s) against the CMIP7 coordinate table."""
-        vert_dims = [d for d in self.requested_dims if d in _VERTICAL_GENERIC_IDS]
+        vert_dims = [d for d in self.requested_dims if d in VERTICAL_GENERIC_IDS]
         if not vert_dims:
             ctx = TestCtx(BaseCheck.HIGH, "[AICC003] Vertical coordinates")
             ctx.add_pass()
@@ -779,8 +779,8 @@ class AICC(BaseNCCheck, BaseCheck):
         """Verify non-grid, non-vertical, non-time coordinate dimensions."""
         other_dims = [
             d for d in self.requested_dims
-            if d not in _HORIZONTAL_DIM_IDS
-            and d not in _VERTICAL_GENERIC_IDS
+            if d not in HORIZONTAL_DIM_IDS
+            and d not in VERTICAL_GENERIC_IDS
             and not _is_time_dim(d)
         ]
         if not other_dims:
@@ -851,14 +851,14 @@ class AICC(BaseNCCheck, BaseCheck):
             return [ctx.to_result()]
 
         axis_entries = self.CTcoords.get("axis_entry", {})
-        has_horizontal = any(d in _HORIZONTAL_DIM_IDS for d in self.requested_dims)
+        has_horizontal = any(d in HORIZONTAL_DIM_IDS for d in self.requested_dims)
 
         # Build expected C-order dims (reverse of CMOR Fortran order, scalars excluded)
         expected = []
         for dim_id in reversed(self.requested_dims):
-            if dim_id in _HORIZONTAL_DIM_IDS:
+            if dim_id in HORIZONTAL_DIM_IDS:
                 continue  # merged into single cell-dim placeholder below
-            if dim_id in _VERTICAL_GENERIC_IDS:
+            if dim_id in VERTICAL_GENERIC_IDS:
                 expected.append("lev")
                 continue
             if _is_time_dim(dim_id):
