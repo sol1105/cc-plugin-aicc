@@ -3,15 +3,20 @@ aicc.py — AWI ICON Coordinate Checker (AICC) / AI Compliance Checker
 
 Verifies CMIP7 coordinate compliance for AWI and ICON model output
 with unstructured horizontal grids.
+
+Variable discovery delegates entirely to compliance_checker.cf.util (cfutil)
+so that CF conventions are applied consistently across the whole checker
+ecosystem rather than being re-implemented here.
 """
 
 import json
 import os
+import re
 from pathlib import Path
 
 import numpy as np
-import xarray as xr
-from compliance_checker.base import BaseCheck, BaseNCCheck, Result
+from compliance_checker.base import BaseCheck, BaseNCCheck, Result, TestCtx
+from compliance_checker.cf import util as cfutil
 
 from cc_plugin_aicc import __version__
 
@@ -62,6 +67,54 @@ def _is_time_dim(dim_id: str) -> bool:
     return dim_id.startswith("time")
 
 
+# Adapted from swarnaleem's attr() — github.com/swarnaleem/cc-plugin-wcrp feature/coordinate-standard db0791d plugins/coordinate_standard/classify.py
+def _ncattr(var_or_ds, name: str, default=""):
+    """Safe attribute read for both netCDF4 variables and Datasets."""
+    return getattr(var_or_ds, name, default) or default
+
+
+# Adapted from swarnaleem's neutral_dtype() — github.com/swarnaleem/cc-plugin-wcrp feature/coordinate-standard db0791d plugins/coordinate_standard/classify.py
+def _neutral_dtype(var) -> str:
+    """Return 'character', 'integer', or 'double' for a netCDF4 variable."""
+    kind = getattr(getattr(var, "dtype", None), "kind", "")
+    if kind in ("S", "U"):
+        return "character"
+    if kind in ("i", "u"):
+        return "integer"
+    return "double"
+
+
+# Adapted from swarnaleem's _compare_units() — github.com/swarnaleem/cc-plugin-wcrp feature/coordinate-standard db0791d plugins/coordinate_standard/matching.py
+def _compare_units(candidate_units: str, entry_units: str) -> tuple:
+    """Tiered units comparison backed by udunits.
+
+    Returns (level, message): 'ok', 'warn' (convertible but not identical),
+    or 'fail'. CMOR time templates like 'days since ?' accept any date.
+    """
+    if not entry_units:
+        return "ok", ""
+    if not candidate_units:
+        return "warn", f"units missing; table expects '{entry_units}'"
+    if candidate_units == entry_units:
+        return "ok", ""
+    if "?" in entry_units:
+        pattern = re.escape(entry_units).replace(r"\?", ".+")
+        if re.fullmatch(pattern, candidate_units):
+            return "ok", ""
+        if " since " in entry_units and " since " in candidate_units:
+            entry_base = entry_units.split(" since ")[0]
+            cand_base = candidate_units.split(" since ")[0]
+            if cfutil.units_convertible(cand_base, entry_base):
+                return "warn", (f"units '{candidate_units}' use base unit "
+                                f"'{cand_base}'; table expects '{entry_base}'")
+        return "fail", (f"units '{candidate_units}' do not match the table "
+                        f"template '{entry_units}'")
+    if cfutil.units_convertible(candidate_units, entry_units):
+        return "warn", (f"units '{candidate_units}' convertible to but not "
+                        f"identical to table units '{entry_units}'")
+    return "fail", f"units '{candidate_units}' not convertible to '{entry_units}'"
+
+
 # ---------------------------------------------------------------------------
 # Plugin class
 # ---------------------------------------------------------------------------
@@ -84,31 +137,19 @@ class AICC(BaseNCCheck):
     def make_result(cls, level, score, out_of, name, messages):
         return Result(level, (score, out_of), name, messages)
 
-    def __del__(self):
-        xrds = getattr(self, "xrds", None)
-        if xrds is not None and hasattr(xrds, "close"):
-            xrds.close()
-
     # ------------------------------------------------------------------
     # setup
     # ------------------------------------------------------------------
 
     def setup(self, dataset):
-        self.dataset = dataset
-        self.filepath = os.path.realpath(
-            os.path.normpath(os.path.expanduser(dataset.filepath()))
-        )
-        self.xrds = xr.open_dataset(self.filepath, decode_times=False)
-        self._all_file_vars = (
-            list(self.xrds.data_vars.keys()) + list(self.xrds.coords.keys())
-        )
+        self.ds = dataset  # netCDF4.Dataset — used by all check methods
 
         # Read CMIP7 CMOR tables
         tables_path = self.options.get("tables", _DEFAULT_TABLES_PATH)
         self._read_cmip7_tables(tables_path)
 
-        # Determine model type from source_id
-        source_id = self._get_attr("source_id")
+        # Determine model type from source_id global attribute
+        source_id = _ncattr(dataset, "source_id")
         if "AWI" in source_id:
             self.model_type = "AWI"
         elif "ICON" in source_id:
@@ -117,13 +158,13 @@ class AICC(BaseNCCheck):
             self.model_type = None
 
         # Identify variable and its CMOR table entry
-        self.branded_variable = self._get_attr("branded_variable") or None
+        self.branded_variable = _ncattr(dataset, "branded_variable") or None
         self.var_entry = None
         self.table_name = None
         self.requested_dims = []
 
         if self.branded_variable:
-            self._resolve_table_and_variable()
+            self._resolve_table_and_variable(dataset)
 
         if self.var_entry is not None:
             self.requested_dims = self.var_entry.get("dimensions", [])
@@ -160,9 +201,7 @@ class AICC(BaseNCCheck):
         def _load(name):
             path = Path(tables_path, f"{self._table_prefix}_{name}.json")
             if not path.exists():
-                raise FileNotFoundError(
-                    f"Required CMIP7 table not found: '{path}'"
-                )
+                raise FileNotFoundError(f"Required CMIP7 table not found: '{path}'")
             with open(path) as fh:
                 return json.load(fh)
 
@@ -183,19 +222,13 @@ class AICC(BaseNCCheck):
     # Variable / table resolution
     # ------------------------------------------------------------------
 
-    def _get_attr(self, attr, default=""):
-        try:
-            return self.dataset.getncattr(attr)
-        except AttributeError:
-            return default
-
-    def _resolve_table_and_variable(self):
+    def _resolve_table_and_variable(self, ds):
         """Resolve *branded_variable* to a var_entry in the appropriate CMOR table."""
-        table_id = self._get_attr("table_id")
+        table_id = _ncattr(ds, "table_id")
         if table_id and table_id in self.CT:
             candidates = [table_id]
         else:
-            realm_raw = self._get_attr("realm")
+            realm_raw = _ncattr(ds, "realm")
             realm_first = realm_raw.split()[0] if realm_raw else ""
             mapped = _REALM_TO_TABLE.get(realm_first)
             candidates = [mapped] if mapped and mapped in self.CT else list(self.CT)
@@ -212,188 +245,202 @@ class AICC(BaseNCCheck):
     # ------------------------------------------------------------------
 
     def check_branded_variable(self, ds):
-        """Verify that branded_variable is set and found in the CMIP7 tables."""
-        desc = "branded_variable identification"
-        level = BaseCheck.HIGH
-        messages = []
+        """Verify branded_variable global attribute is set and resolvable."""
+        ctx = TestCtx(BaseCheck.HIGH, "[AICC001] branded_variable identification")
 
         if not self.branded_variable:
-            return self.make_result(
-                level, 0, 1, desc,
-                ["Global attribute 'branded_variable' is not set. "
-                 "Cannot identify the variable for CMOR table lookup."],
+            ctx.add_failure(
+                "Global attribute 'branded_variable' is not set. "
+                "Cannot identify the variable for CMOR table lookup."
             )
+            return [ctx.to_result()]
 
         if self.var_entry is None:
-            return self.make_result(
-                level, 0, 1, desc,
-                [f"branded_variable '{self.branded_variable}' not found in any "
-                 f"CMIP7 table (tried table_id='{self._get_attr('table_id')}', "
-                 f"realm='{self._get_attr('realm')}')."],
+            ctx.add_failure(
+                f"branded_variable '{self.branded_variable}' not found in any "
+                f"CMIP7 table (tried table_id='{_ncattr(ds, 'table_id')}', "
+                f"realm='{_ncattr(ds, 'realm')}')."
             )
+            return [ctx.to_result()]
 
-        return self.make_result(level, 1, 1, desc, messages)
+        ctx.add_pass()
+        return [ctx.to_result()]
 
     # ------------------------------------------------------------------
 
     def check_grid(self, ds):
         """Verify unstructured horizontal grid auxiliary coordinates and vertices."""
-        desc = "Horizontal grid coordinates"
-        level = BaseCheck.HIGH
-        messages = []
-
         has_lat = "latitude" in self.requested_dims
         has_lon = "longitude" in self.requested_dims
         if not (has_lat or has_lon):
-            return self.make_result(level, 1, 1, desc, messages)
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC002] Horizontal grid coordinates")
+            ctx.add_pass()
+            return [ctx.to_result()]
 
-        out_of = 0
-        score = 0
+        results = []
         grid_var_entries = self.CTgrids.get("variable_entry", {})
-        data_var_out_name = (
-            self.var_entry.get("out_name", "") if self.var_entry else ""
-        )
 
-        for dim_id in ("latitude", "longitude"):
+        # Use cfutil for CF-aware variable discovery
+        aux_coord_names = set(cfutil.get_auxiliary_coordinate_variables(ds))
+        lat_vars = cfutil.get_true_latitude_variables(ds)
+        lon_vars = cfutil.get_true_longitude_variables(ds)
+
+        for dim_id, cf_vars in (("latitude", lat_vars), ("longitude", lon_vars)):
             if dim_id not in self.requested_dims:
                 continue
 
+            ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {dim_id} auxiliary coordinate")
             grid_entry = grid_var_entries.get(dim_id, {})
-            out_name = grid_entry.get("out_name", dim_id)
-            expected_sn = grid_entry.get("standard_name", "")
             expected_units = grid_entry.get("units", "")
-
-            # Auxiliary lat/lon variable must exist
-            out_of += 1
-            aux_var = self._find_var_by(standard_name=expected_sn)
-            if aux_var is None:
-                messages.append(
-                    f"No auxiliary coordinate with standard_name='{expected_sn}' "
-                    f"found for horizontal dim_id='{dim_id}' (expected out_name='{out_name}')."
-                )
-                continue
-            score += 1
-
-            # Check units
-            out_of += 1
-            actual_units = self.xrds[aux_var].attrs.get("units", "")
-            if actual_units != expected_units:
-                messages.append(
-                    f"Auxiliary coordinate '{aux_var}' (standard_name='{expected_sn}') "
-                    f"units='{actual_units}', expected '{expected_units}'."
-                )
-            else:
-                score += 1
-
-            # Must be 1-D (single cell/ncells dimension)
-            out_of += 1
-            if len(self.xrds[aux_var].dims) != 1:
-                messages.append(
-                    f"Auxiliary coordinate '{aux_var}' must have exactly one dimension "
-                    f"(cell/ncells) for unstructured grids; "
-                    f"found dims={list(self.xrds[aux_var].dims)}."
-                )
-            else:
-                score += 1
-
-            # Vertex bounds variable (vertices_latitude / vertices_longitude)
             vtx_key = f"vertices_{dim_id}"
             vtx_entry = grid_var_entries.get(vtx_key, {})
             vtx_out_name = vtx_entry.get("out_name", vtx_key)
-            vtx_sn = vtx_entry.get("standard_name", "")
+            vtx_expected_units = vtx_entry.get("units", "")
 
-            out_of += 1
-            vtx_var = self._find_var_by(name=vtx_out_name, standard_name=vtx_sn)
-            if vtx_var is None:
-                messages.append(
-                    f"Vertex bounds variable '{vtx_out_name}' not found "
-                    f"for '{dim_id}' auxiliary coordinate."
+            # Prefer variables that cfutil classified as auxiliary
+            aux_matches = [v for v in cf_vars if v in aux_coord_names]
+            if not aux_matches:
+                aux_matches = cf_vars  # fall through; 1-D check will catch it
+
+            if not aux_matches:
+                ctx.add_failure(
+                    f"No {dim_id} auxiliary coordinate variable found in the file "
+                    f"(expected standard_name='{dim_id}' or matching units)."
+                )
+                results.append(ctx.to_result())
+                continue
+            ctx.add_pass()
+
+            aux_var_name = aux_matches[0]
+            aux_var = ds.variables[aux_var_name]
+
+            # Must be 1-D (single unstructured cell dimension)
+            if aux_var.ndim != 1:
+                ctx.add_failure(
+                    f"'{aux_var_name}' must have exactly one dimension (cell/ncells) "
+                    f"for an unstructured grid; found ndim={aux_var.ndim}."
                 )
             else:
-                score += 1
-                # units
-                out_of += 1
-                vtx_units = vtx_entry.get("units", "")
-                if self.xrds[vtx_var].attrs.get("units", "") != vtx_units:
-                    messages.append(
-                        f"Vertex variable '{vtx_var}' units="
-                        f"'{self.xrds[vtx_var].attrs.get('units', '')}', "
-                        f"expected '{vtx_units}'."
-                    )
-                else:
-                    score += 1
-                # Must be 2-D (ncells, ncorners)
-                out_of += 1
-                if len(self.xrds[vtx_var].dims) != 2:
-                    messages.append(
-                        f"Vertex variable '{vtx_var}' must have 2 dimensions "
-                        f"(ncells, ncorners); "
-                        f"found dims={list(self.xrds[vtx_var].dims)}."
-                    )
-                else:
-                    score += 1
+                ctx.add_pass()
 
-        # Data variable must have lat/lon auxiliary coords in 'coordinates' attribute
-        if data_var_out_name and data_var_out_name in self.xrds:
-            coord_attr = self.xrds[data_var_out_name].attrs.get("coordinates", "")
-            coord_vars_listed = coord_attr.split()
-            for dim_id, exp_sn in [
-                ("latitude", grid_var_entries.get("latitude", {}).get("standard_name", "latitude")),
-                ("longitude", grid_var_entries.get("longitude", {}).get("standard_name", "longitude")),
-            ]:
+            # Must be auxiliary (not a dimension coordinate)
+            if aux_var_name not in aux_coord_names:
+                ctx.add_failure(
+                    f"'{aux_var_name}' is a dimension coordinate; for an unstructured "
+                    f"grid it must be an auxiliary coordinate referenced via "
+                    f"the 'coordinates' attribute."
+                )
+            else:
+                ctx.add_pass()
+
+            # Units via cfutil-backed comparison
+            level, msg = _compare_units(_ncattr(aux_var, "units"), expected_units)
+            if level == "fail":
+                ctx.add_failure(f"'{aux_var_name}' units: {msg}")
+            else:
+                ctx.add_pass()  # pass even for convertible (advisory only)
+
+            results.append(ctx.to_result())
+
+            # --- Vertex bounds ---
+            vtx_ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {vtx_key}")
+            # Look for the vertices variable by exact out_name or 'vertices_*' naming
+            vtx_var_name = vtx_out_name if vtx_out_name in ds.variables else next(
+                (v for v in ds.variables
+                 if v == vtx_out_name or (
+                     "vertices" in v.lower()
+                     and dim_id in v.lower())),
+                None,
+            )
+            if vtx_var_name is None:
+                vtx_ctx.add_failure(
+                    f"Vertex bounds variable '{vtx_out_name}' not found for '{dim_id}'."
+                )
+                results.append(vtx_ctx.to_result())
+                continue
+            vtx_ctx.add_pass()
+
+            vtx_var = ds.variables[vtx_var_name]
+
+            if vtx_var.ndim != 2:
+                vtx_ctx.add_failure(
+                    f"'{vtx_var_name}' must have 2 dimensions (ncells, ncorners); "
+                    f"found ndim={vtx_var.ndim}."
+                )
+            else:
+                vtx_ctx.add_pass()
+
+            level, msg = _compare_units(_ncattr(vtx_var, "units"), vtx_expected_units)
+            if level == "fail":
+                vtx_ctx.add_failure(f"'{vtx_var_name}' units: {msg}")
+            else:
+                vtx_ctx.add_pass()
+
+            results.append(vtx_ctx.to_result())
+
+        # Data variable must list lat/lon in its 'coordinates' attribute
+        data_out_name = self.var_entry.get("out_name", "") if self.var_entry else ""
+        if data_out_name and data_out_name in ds.variables:
+            data_var = ds.variables[data_out_name]
+            coords_attr = _ncattr(data_var, "coordinates")
+            coords_listed = coords_attr.split() if coords_attr else []
+
+            for dim_id, cf_vars in (("latitude", lat_vars), ("longitude", lon_vars)):
                 if dim_id not in self.requested_dims:
                     continue
-                out_of += 1
-                found_in_coords = any(
-                    self.xrds[v].attrs.get("standard_name") == exp_sn
-                    for v in coord_vars_listed
-                    if v in self.xrds
+                ctx = TestCtx(
+                    BaseCheck.HIGH,
+                    f"[AICC002] '{data_out_name}' coordinates attribute ({dim_id})",
                 )
-                if not found_in_coords:
-                    messages.append(
-                        f"Data variable '{data_var_out_name}' 'coordinates' attribute "
-                        f"must include the {dim_id} auxiliary coordinate "
-                        f"(standard_name='{exp_sn}')."
+                found = any(
+                    getattr(ds.variables.get(v), "standard_name", None) == dim_id
+                    for v in coords_listed
+                )
+                if not found:
+                    ctx.add_failure(
+                        f"'{data_out_name}' 'coordinates' attribute must include the "
+                        f"{dim_id} auxiliary coordinate (standard_name='{dim_id}')."
                     )
                 else:
-                    score += 1
+                    ctx.add_pass()
+                results.append(ctx.to_result())
 
-        if out_of == 0:
-            return self.make_result(level, 1, 1, desc, messages)
-        return self.make_result(level, score, out_of, desc, messages)
+        return results
 
     # ------------------------------------------------------------------
 
     def check_vertical(self, ds):
         """Verify vertical coordinate(s) against the CMIP7 coordinate table."""
-        desc = "Vertical coordinates"
-        level = BaseCheck.HIGH
-        messages = []
-
         vert_dims = [d for d in self.requested_dims if d in _VERTICAL_GENERIC_IDS]
         if not vert_dims:
-            return self.make_result(level, 1, 1, desc, messages)
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC003] Vertical coordinates")
+            ctx.add_pass()
+            return [ctx.to_result()]
 
         if self.model_type is None:
-            return self.make_result(
-                level, 0, 1, desc,
-                ["source_id contains neither 'AWI' nor 'ICON'; "
-                 "cannot resolve generic vertical coordinate mapping."],
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC003] Vertical coordinates")
+            ctx.add_failure(
+                "source_id contains neither 'AWI' nor 'ICON'; "
+                "cannot resolve generic vertical coordinate mapping."
             )
+            return [ctx.to_result()]
 
-        out_of = 0
-        score = 0
+        results = []
         axis_entries = self.CTcoords.get("axis_entry", {})
         formula_entries = self.CTformulas.get("formula_entry", {})
+
+        # Use cfutil for CF-aware Z variable discovery
+        z_var_names = set(cfutil.get_z_variables(ds))
 
         for generic_id in vert_dims:
             coord_key = _VERTICAL_MAPPING[self.model_type].get(generic_id)
             if not coord_key:
-                out_of += 1
-                messages.append(
-                    f"No vertical coordinate mapping for generic_id='{generic_id}' "
+                ctx = TestCtx(BaseCheck.HIGH, f"[AICC003] {generic_id}")
+                ctx.add_failure(
+                    f"No vertical coordinate mapping for '{generic_id}' "
                     f"and model_type='{self.model_type}'."
                 )
+                results.append(ctx.to_result())
                 continue
 
             ce = axis_entries.get(coord_key, {})
@@ -405,161 +452,160 @@ class AICC(BaseNCCheck):
             z_factors_str = ce.get("z_factors", "")
             z_bounds_factors_str = ce.get("z_bounds_factors", "")
 
-            # Locate the lev variable
-            out_of += 1
-            lev_var = self._find_var_by(name=out_name, standard_name=expected_sn, axis="Z")
-            if lev_var is None:
-                messages.append(
-                    f"Vertical coordinate variable not found for '{generic_id}' "
-                    f"(expected out_name='{out_name}', "
-                    f"standard_name='{expected_sn}')."
+            ctx = TestCtx(
+                BaseCheck.HIGH,
+                f"[AICC003] Vertical coordinate '{out_name}' ({generic_id})",
+            )
+
+            # Locate lev variable: exact out_name, then cfutil Z vars by standard_name
+            if out_name in ds.variables:
+                lev_var_name = out_name
+            else:
+                lev_var_name = next(
+                    (v for v in z_var_names
+                     if expected_sn and getattr(ds.variables[v], "standard_name", None) == expected_sn),
+                    next(iter(z_var_names), None) if z_var_names else None,
                 )
+
+            if lev_var_name is None:
+                ctx.add_failure(
+                    f"Vertical coordinate variable not found for '{generic_id}' "
+                    f"(expected out_name='{out_name}', standard_name='{expected_sn}')."
+                )
+                results.append(ctx.to_result())
                 continue
-            score += 1
+            ctx.add_pass()
+
+            lev_var = ds.variables[lev_var_name]
 
             # axis=Z
-            out_of += 1
-            if self.xrds[lev_var].attrs.get("axis", "") != "Z":
-                messages.append(
-                    f"Vertical coordinate '{lev_var}' must have attribute axis='Z'."
-                )
+            if _ncattr(lev_var, "axis") != "Z":
+                ctx.add_failure(f"'{lev_var_name}' must have attribute axis='Z'.")
             else:
-                score += 1
+                ctx.add_pass()
 
             # standard_name
             if expected_sn:
-                out_of += 1
-                if self.xrds[lev_var].attrs.get("standard_name", "") != expected_sn:
-                    messages.append(
-                        f"'{lev_var}' standard_name="
-                        f"'{self.xrds[lev_var].attrs.get('standard_name', '')}', "
+                actual_sn = _ncattr(lev_var, "standard_name")
+                if actual_sn != expected_sn:
+                    ctx.add_failure(
+                        f"'{lev_var_name}' standard_name='{actual_sn}'; "
                         f"expected '{expected_sn}'."
                     )
                 else:
-                    score += 1
+                    ctx.add_pass()
 
-            # units
+            # units (via udunits-backed comparison)
             if expected_units:
-                out_of += 1
-                if self.xrds[lev_var].attrs.get("units", "") != expected_units:
-                    messages.append(
-                        f"'{lev_var}' units="
-                        f"'{self.xrds[lev_var].attrs.get('units', '')}', "
-                        f"expected '{expected_units}'."
-                    )
+                level, msg = _compare_units(_ncattr(lev_var, "units"), expected_units)
+                if level == "fail":
+                    ctx.add_failure(f"'{lev_var_name}' units: {msg}")
                 else:
-                    score += 1
+                    ctx.add_pass()
 
             # positive
             if expected_positive:
-                out_of += 1
-                if self.xrds[lev_var].attrs.get("positive", "") != expected_positive:
-                    messages.append(
-                        f"'{lev_var}' positive="
-                        f"'{self.xrds[lev_var].attrs.get('positive', '')}', "
+                actual_pos = _ncattr(lev_var, "positive")
+                if actual_pos != expected_positive:
+                    ctx.add_failure(
+                        f"'{lev_var_name}' positive='{actual_pos}'; "
                         f"expected '{expected_positive}'."
                     )
                 else:
-                    score += 1
+                    ctx.add_pass()
 
             # bounds
             if must_have_bounds:
-                bnds_name = f"{lev_var}_bnds"
-                out_of += 1
-                # lev must declare its bounds
-                declared_bnds = self.xrds[lev_var].attrs.get("bounds", "")
+                bnds_name = f"{lev_var_name}_bnds"
+                declared_bnds = _ncattr(lev_var, "bounds")
                 if declared_bnds != bnds_name:
-                    messages.append(
-                        f"'{lev_var}' bounds attribute is '{declared_bnds}', "
+                    ctx.add_failure(
+                        f"'{lev_var_name}' bounds='{declared_bnds}'; "
                         f"expected '{bnds_name}'."
                     )
                 else:
-                    score += 1
+                    ctx.add_pass()
 
-                out_of += 1
-                if bnds_name not in self.xrds:
-                    messages.append(
-                        f"Bounds variable '{bnds_name}' for '{lev_var}' not found in file."
+                if bnds_name not in ds.variables:
+                    ctx.add_failure(
+                        f"Bounds variable '{bnds_name}' for '{lev_var_name}' not found."
                     )
                 else:
-                    score += 1
-                    # lev_bnds must have NO attributes
-                    out_of += 1
-                    if self.xrds[bnds_name].attrs:
-                        messages.append(
+                    ctx.add_pass()
+                    bnds_var = ds.variables[bnds_name]
+                    if bnds_var.ncattrs():
+                        ctx.add_failure(
                             f"'{bnds_name}' must have no attributes; "
-                            f"found: {list(self.xrds[bnds_name].attrs.keys())}."
+                            f"found: {list(bnds_var.ncattrs())}."
                         )
                     else:
-                        score += 1
+                        ctx.add_pass()
 
-            # formula_terms (for hybrid / formula-based coordinates)
+            # formula_terms
             if z_factors_str:
-                out_of += 1
-                ft_attr = self.xrds[lev_var].attrs.get("formula_terms", "")
+                ft_attr = _ncattr(lev_var, "formula_terms")
                 if not ft_attr:
-                    messages.append(
-                        f"'{lev_var}' must have 'formula_terms' attribute "
+                    ctx.add_failure(
+                        f"'{lev_var_name}' must have 'formula_terms' attribute "
                         f"(formula: '{ce.get('formula', '')}')."
                     )
                 else:
-                    score += 1
+                    ctx.add_pass()
                     ft_map = _parse_formula_terms(ft_attr)
                     for term, var_name in ft_map.items():
-                        out_of += 1
-                        if var_name not in self.xrds:
-                            messages.append(
-                                f"Formula term '{term}' references '{var_name}' "
-                                f"which is not found in the file."
+                        if var_name not in ds.variables:
+                            ctx.add_failure(
+                                f"formula_terms: term '{term}' references '{var_name}' "
+                                f"which does not exist in the file."
                             )
                         else:
-                            score += 1
-                            # Verify formula term variable attributes against formula_terms table
-                            ft_entry = _find_formula_entry(formula_entries, var_name, generic_id)
+                            ctx.add_pass()
+                            ft_entry = _find_formula_entry(
+                                formula_entries, var_name, generic_id
+                            )
                             if ft_entry:
-                                out_of, score, msgs = _check_formula_var_attrs(
-                                    self.xrds[var_name], var_name, ft_entry, out_of, score
+                                _check_formula_var_attrs(
+                                    ctx, ds.variables[var_name], var_name, ft_entry
                                 )
-                                messages.extend(msgs)
 
             # bounds formula terms
             if must_have_bounds and z_bounds_factors_str:
                 zbf_map = _parse_formula_terms(z_bounds_factors_str)
                 for term, var_name in zbf_map.items():
-                    out_of += 1
-                    if var_name not in self.xrds:
-                        messages.append(
-                            f"Bounds formula term '{term}' references '{var_name}' "
-                            f"which is not found in the file."
+                    if var_name not in ds.variables:
+                        ctx.add_failure(
+                            f"bounds formula_terms: term '{term}' references "
+                            f"'{var_name}' which does not exist."
                         )
                     else:
-                        score += 1
-                        ft_entry = _find_formula_entry(formula_entries, var_name, generic_id)
+                        ctx.add_pass()
+                        ft_entry = _find_formula_entry(
+                            formula_entries, var_name, generic_id
+                        )
                         if ft_entry:
-                            out_of, score, msgs = _check_formula_var_attrs(
-                                self.xrds[var_name], var_name, ft_entry, out_of, score
+                            _check_formula_var_attrs(
+                                ctx, ds.variables[var_name], var_name, ft_entry
                             )
-                            messages.extend(msgs)
 
-        if out_of == 0:
-            return self.make_result(level, 1, 1, desc, messages)
-        return self.make_result(level, score, out_of, desc, messages)
+            results.append(ctx.to_result())
+
+        return results
 
     # ------------------------------------------------------------------
 
     def check_time(self, ds):
         """Verify time coordinate(s) against the CMIP7 coordinate table."""
-        desc = "Time coordinate"
-        level = BaseCheck.HIGH
-        messages = []
-
         time_dims = [d for d in self.requested_dims if _is_time_dim(d)]
         if not time_dims:
-            return self.make_result(level, 1, 1, desc, messages)
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC004] Time coordinate")
+            ctx.add_pass()
+            return [ctx.to_result()]
 
-        out_of = 0
-        score = 0
+        results = []
         axis_entries = self.CTcoords.get("axis_entry", {})
+
+        # Use cfutil to find the time variable (CF-aware, not name-based)
+        t_var_name = cfutil.get_time_variable(ds)
 
         for time_dim_id in time_dims:
             ce = axis_entries.get(time_dim_id, {})
@@ -567,127 +613,113 @@ class AICC(BaseNCCheck):
             must_have_bounds = ce.get("must_have_bounds", "no") == "yes"
             is_climatology = ce.get("climatology", "") == "yes"
 
-            # Locate time variable
-            out_of += 1
-            time_var = self._find_var_by(
-                name=out_name, standard_name="time", axis="T"
+            ctx = TestCtx(
+                BaseCheck.HIGH, f"[AICC004] Time coordinate ({time_dim_id})"
             )
-            if time_var is None:
-                messages.append(
+
+            resolved_t = t_var_name or (out_name if out_name in ds.variables else None)
+            if resolved_t is None:
+                ctx.add_failure(
                     f"Time coordinate variable '{out_name}' (dim_id='{time_dim_id}') "
                     f"not found in file."
                 )
+                results.append(ctx.to_result())
                 continue
-            score += 1
+            ctx.add_pass()
+
+            t_var = ds.variables[resolved_t]
 
             # axis=T
-            out_of += 1
-            if self.xrds[time_var].attrs.get("axis", "") != "T":
-                messages.append(
-                    f"Time variable '{time_var}' must have attribute axis='T'."
-                )
+            if _ncattr(t_var, "axis") != "T":
+                ctx.add_failure(f"'{resolved_t}' must have attribute axis='T'.")
             else:
-                score += 1
+                ctx.add_pass()
 
             # standard_name=time
-            out_of += 1
-            if self.xrds[time_var].attrs.get("standard_name", "") != "time":
-                messages.append(
-                    f"Time variable '{time_var}' standard_name="
-                    f"'{self.xrds[time_var].attrs.get('standard_name', '')}', "
-                    f"expected 'time'."
+            if _ncattr(t_var, "standard_name") != "time":
+                ctx.add_failure(
+                    f"'{resolved_t}' standard_name='"
+                    f"{_ncattr(t_var, 'standard_name')}'; expected 'time'."
                 )
             else:
-                score += 1
+                ctx.add_pass()
 
-            # units: must contain "since"
-            out_of += 1
-            units = self.xrds[time_var].attrs.get(
-                "units", self.xrds[time_var].encoding.get("units", "")
-            )
-            if not units or "since" not in str(units):
-                messages.append(
-                    f"Time variable '{time_var}' units='{units}' is missing or invalid "
-                    f"(expected format 'X since Y')."
+            # units: must contain "since" and have a udunits-known base unit
+            units = _ncattr(t_var, "units")
+            if not units or "since" not in units:
+                ctx.add_failure(
+                    f"'{resolved_t}' units='{units}' is missing or invalid "
+                    f"(expected format 'X since Y-M-D ...')."
+                )
+            elif not cfutil.units_known(units.split(" since ")[0]):
+                ctx.add_failure(
+                    f"'{resolved_t}' time base unit "
+                    f"'{units.split(' since ')[0]}' not recognized by udunits."
                 )
             else:
-                score += 1
+                ctx.add_pass()
 
             # calendar attribute
-            out_of += 1
-            calendar = self.xrds[time_var].attrs.get(
-                "calendar", self.xrds[time_var].encoding.get("calendar", "")
-            )
-            if not calendar:
-                messages.append(
-                    f"Time variable '{time_var}' is missing 'calendar' attribute."
-                )
+            if not _ncattr(t_var, "calendar"):
+                ctx.add_failure(f"'{resolved_t}' is missing 'calendar' attribute.")
             else:
-                score += 1
+                ctx.add_pass()
 
             if must_have_bounds:
                 if is_climatology:
-                    # Expect a 'climatology' attribute pointing to the climatology-bounds variable
-                    out_of += 1
-                    clim_attr = self.xrds[time_var].attrs.get("climatology", "")
+                    # CF §7.4: time must carry a 'climatology' attribute
+                    clim_attr = _ncattr(t_var, "climatology")
                     if not clim_attr:
-                        messages.append(
-                            f"Climatology time variable '{time_var}' must have a "
+                        ctx.add_failure(
+                            f"Climatology time variable '{resolved_t}' must have a "
                             f"'climatology' attribute pointing to the bounds variable."
                         )
                     else:
-                        score += 1
-                        out_of += 1
-                        if clim_attr not in self.xrds:
-                            messages.append(
+                        ctx.add_pass()
+                        # verify the bounds variable exists (cfutil agrees)
+                        clim_bnds = cfutil.get_climatology_variable(ds)
+                        if clim_attr not in ds.variables:
+                            ctx.add_failure(
                                 f"Climatology bounds variable '{clim_attr}' "
-                                f"(referenced by '{time_var}:climatology') "
-                                f"not found in file."
+                                f"(referenced by '{resolved_t}:climatology') not found."
                             )
                         else:
-                            score += 1
+                            ctx.add_pass()
                 else:
                     # Regular time bounds
                     bnds_name = f"{out_name}_bnds"
-                    out_of += 1
-                    declared_bnds = self.xrds[time_var].attrs.get("bounds", "")
+                    declared_bnds = _ncattr(t_var, "bounds")
                     if declared_bnds != bnds_name:
-                        messages.append(
-                            f"'{time_var}' bounds attribute='{declared_bnds}', "
+                        ctx.add_failure(
+                            f"'{resolved_t}' bounds='{declared_bnds}'; "
                             f"expected '{bnds_name}'."
                         )
                     else:
-                        score += 1
+                        ctx.add_pass()
 
-                    out_of += 1
-                    if bnds_name not in self.xrds:
-                        messages.append(
+                    if bnds_name not in ds.variables:
+                        ctx.add_failure(
                             f"Time bounds variable '{bnds_name}' not found in file."
                         )
                     else:
-                        score += 1
-                        # time_bnds must have NO attributes
-                        out_of += 1
-                        if self.xrds[bnds_name].attrs:
-                            messages.append(
+                        ctx.add_pass()
+                        bnds_var = ds.variables[bnds_name]
+                        if bnds_var.ncattrs():
+                            ctx.add_failure(
                                 f"'{bnds_name}' must have no attributes; "
-                                f"found: {list(self.xrds[bnds_name].attrs.keys())}."
+                                f"found: {list(bnds_var.ncattrs())}."
                             )
                         else:
-                            score += 1
+                            ctx.add_pass()
 
-        if out_of == 0:
-            return self.make_result(level, 1, 1, desc, messages)
-        return self.make_result(level, score, out_of, desc, messages)
+            results.append(ctx.to_result())
+
+        return results
 
     # ------------------------------------------------------------------
 
     def check_coord(self, ds):
         """Verify non-grid, non-vertical, non-time coordinate dimensions."""
-        desc = "Other coordinates"
-        level = BaseCheck.HIGH
-        messages = []
-
         other_dims = [
             d for d in self.requested_dims
             if d not in _HORIZONTAL_DIM_IDS
@@ -695,22 +727,28 @@ class AICC(BaseNCCheck):
             and not _is_time_dim(d)
         ]
         if not other_dims:
-            return self.make_result(level, 1, 1, desc, messages)
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC005] Other coordinates")
+            ctx.add_pass()
+            return [ctx.to_result()]
 
-        out_of = 0
-        score = 0
+        results = []
         axis_entries = self.CTcoords.get("axis_entry", {})
-        data_out_name = (
-            self.var_entry.get("out_name", "") if self.var_entry else ""
-        )
+        data_out_name = self.var_entry.get("out_name", "") if self.var_entry else ""
+
+        # Use cfutil to classify what is in the file
+        aux_coord_names = set(cfutil.get_auxiliary_coordinate_variables(ds))
+        dim_coord_names = set(cfutil.get_coordinate_variables(ds))
+        bnds_map = cfutil.get_cell_boundary_map(ds)  # {var_name: bnds_name}
 
         for dim_id in other_dims:
             ce = axis_entries.get(dim_id)
+            ctx = TestCtx(BaseCheck.HIGH, f"[AICC005] Coordinate '{dim_id}'")
+
             if ce is None:
-                out_of += 1
-                messages.append(
+                ctx.add_failure(
                     f"dim_id '{dim_id}' not found in CMIP7 coordinate table."
                 )
+                results.append(ctx.to_result())
                 continue
 
             out_name = ce.get("out_name", dim_id)
@@ -719,42 +757,39 @@ class AICC(BaseNCCheck):
             requested = _as_list(ce.get("requested", []))
             requested_bounds = _as_list(ce.get("requested_bounds", []))
             must_have_bounds = ce.get("must_have_bounds", "no") == "yes"
+            expected_units = ce.get("units", "")
             is_character = coord_type == "character"
             is_multi = bool(requested)
 
             if is_multi:
-                out_of, score, msgs = self._check_multi_value_coord(
-                    dim_id, out_name, ce, requested, requested_bounds,
-                    must_have_bounds, is_character, out_of, score
+                _check_multi_value_coord(
+                    ctx, ds, out_name, ce, requested, requested_bounds,
+                    must_have_bounds, is_character, expected_units, bnds_map,
                 )
             else:
-                out_of, score, msgs = self._check_scalar_coord(
-                    dim_id, out_name, ce, value, is_character,
-                    data_out_name, out_of, score
+                _check_scalar_coord(
+                    ctx, ds, dim_id, out_name, ce, value, is_character,
+                    data_out_name, dim_coord_names, aux_coord_names,
                 )
-            messages.extend(msgs)
 
-        if out_of == 0:
-            return self.make_result(level, 1, 1, desc, messages)
-        return self.make_result(level, score, out_of, desc, messages)
+            results.append(ctx.to_result())
+
+        return results
 
     # ------------------------------------------------------------------
 
     def check_dimensions(self, ds):
         """Verify that the data variable's dimensions are in the expected C order."""
-        desc = "Variable dimension ordering"
-        level = BaseCheck.HIGH
-        messages = []
+        ctx = TestCtx(BaseCheck.HIGH, "[AICC006] Variable dimension ordering")
 
         if self.var_entry is None:
-            return self.make_result(
-                level, 0, 1, desc,
-                ["Cannot check dimensions: CMOR table entry not resolved."],
-            )
+            ctx.add_failure("Cannot check dimensions: CMOR table entry not resolved.")
+            return [ctx.to_result()]
 
         data_out_name = self.var_entry.get("out_name", "")
-        if not data_out_name or data_out_name not in self.xrds:
-            return self.make_result(level, 1, 1, desc, messages)
+        if not data_out_name or data_out_name not in ds.variables:
+            ctx.add_pass()
+            return [ctx.to_result()]
 
         axis_entries = self.CTcoords.get("axis_entry", {})
         has_horizontal = any(d in _HORIZONTAL_DIM_IDS for d in self.requested_dims)
@@ -763,7 +798,7 @@ class AICC(BaseNCCheck):
         expected = []
         for dim_id in reversed(self.requested_dims):
             if dim_id in _HORIZONTAL_DIM_IDS:
-                continue  # handled as single cell-dim placeholder below
+                continue  # merged into single cell-dim placeholder below
             if dim_id in _VERTICAL_GENERIC_IDS:
                 expected.append("lev")
                 continue
@@ -772,279 +807,37 @@ class AICC(BaseNCCheck):
                 expected.append(ce.get("out_name", "time"))
                 continue
             ce = axis_entries.get(dim_id, {})
-            if ce:
-                if _is_scalar_coord(ce):
-                    continue  # scalar coords not in variable dims
-                expected.append(ce.get("out_name", dim_id))
+            if ce and _is_scalar_coord(ce):
+                continue  # scalar coords never appear in variable dims
+            expected.append(ce.get("out_name", dim_id) if ce else dim_id)
 
-        # Insert horizontal placeholder at the innermost (last) position
         if has_horizontal:
-            expected.append("<ncells>")
+            expected.append("<ncells>")  # any name acceptable for unstructured cell dim
 
-        actual = list(self.xrds[data_out_name].dims)
-        out_of = 1
-        score = 0
+        actual = list(ds.variables[data_out_name].dimensions)
 
         if len(actual) != len(expected):
-            messages.append(
-                f"Variable '{data_out_name}' has {len(actual)} dimension(s) "
-                f"{actual}; expected {len(expected)} based on CMOR dims "
+            ctx.add_failure(
+                f"'{data_out_name}' has {len(actual)} dimension(s) {actual}; "
+                f"expected {len(expected)} based on CMOR dims "
                 f"{self.requested_dims} → {expected}."
             )
         else:
-            mismatches = []
-            for i, (exp, act) in enumerate(zip(expected, actual)):
-                if exp == "<ncells>":
-                    continue  # any name acceptable for unstructured cell dim
-                if exp != act:
-                    mismatches.append(f"position {i}: '{act}' (expected '{exp}')")
+            mismatches = [
+                f"position {i}: '{act}' (expected '{exp}')"
+                for i, (exp, act) in enumerate(zip(expected, actual))
+                if exp != "<ncells>" and exp != act
+            ]
             if mismatches:
-                messages.append(
-                    f"Variable '{data_out_name}' dimension order mismatch: "
+                ctx.add_failure(
+                    f"'{data_out_name}' dimension order mismatch: "
                     + "; ".join(mismatches)
                     + f". CMOR dims: {self.requested_dims}."
                 )
             else:
-                score = 1
+                ctx.add_pass()
 
-        return self.make_result(level, score, out_of, desc, messages)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _find_var_by(self, name=None, standard_name=None, axis=None):
-        """Return the first file variable matching the given criteria."""
-        for v in self._all_file_vars:
-            if name and v == name:
-                return v
-            if standard_name and self.xrds[v].attrs.get("standard_name") == standard_name:
-                if axis is None or self.xrds[v].attrs.get("axis") == axis:
-                    return v
-            if axis and not standard_name and self.xrds[v].attrs.get("axis") == axis:
-                return v
-        return None
-
-    def _check_scalar_coord(self, dim_id, out_name, ce, value, is_character,
-                            data_out_name, out_of, score):
-        """Check a scalar coordinate (dimensionless, referenced in 'coordinates')."""
-        messages = []
-
-        # Locate the coordinate variable (allow lookup by standard_name as fallback)
-        out_of += 1
-        coord_var = None
-        if out_name in self.xrds:
-            coord_var = out_name
-        else:
-            sn = ce.get("standard_name", "")
-            if sn:
-                coord_var = self._find_var_by(standard_name=sn)
-
-        if coord_var is None:
-            messages.append(
-                f"Scalar coordinate '{out_name}' (dim_id='{dim_id}') not found in file."
-            )
-            return out_of, score, messages
-        score += 1
-
-        if is_character:
-            # Character scalar: only dimension is 'strlen'
-            out_of += 1
-            dims = list(self.xrds[coord_var].dims)
-            if dims != ["strlen"]:
-                messages.append(
-                    f"Character scalar coordinate '{coord_var}' must have only "
-                    f"dimension 'strlen'; found {dims}."
-                )
-            else:
-                score += 1
-        else:
-            # Numeric scalar: fully dimensionless
-            out_of += 1
-            if self.xrds[coord_var].dims:
-                messages.append(
-                    f"Scalar coordinate '{coord_var}' (dim_id='{dim_id}') must be "
-                    f"dimensionless; found dims={list(self.xrds[coord_var].dims)}."
-                )
-            else:
-                score += 1
-            # Verify value
-            if value:
-                out_of += 1
-                try:
-                    actual = float(np.asarray(self.xrds[coord_var].values).flat[0])
-                    expected = float(value)
-                    if not np.isclose(actual, expected, rtol=1e-5, atol=0):
-                        messages.append(
-                            f"Scalar coordinate '{coord_var}' value={actual}, "
-                            f"expected {expected}."
-                        )
-                    else:
-                        score += 1
-                except (TypeError, ValueError):
-                    score += 1  # non-numeric – skip value check
-
-        # Data variable must list this coord in its 'coordinates' attribute
-        if data_out_name and data_out_name in self.xrds:
-            out_of += 1
-            coord_attr = self.xrds[data_out_name].attrs.get("coordinates", "")
-            if out_name not in coord_attr.split():
-                messages.append(
-                    f"Data variable '{data_out_name}' 'coordinates' attribute must "
-                    f"include scalar coordinate '{out_name}' (dim_id='{dim_id}'); "
-                    f"current value: '{coord_attr}'."
-                )
-            else:
-                score += 1
-
-        return out_of, score, messages
-
-    def _check_multi_value_coord(self, dim_id, out_name, ce, requested,
-                                  requested_bounds, must_have_bounds, is_character,
-                                  out_of, score):
-        """Check a multi-value coordinate (dimension coordinate with requested values)."""
-        messages = []
-
-        # Locate coordinate variable
-        out_of += 1
-        coord_var = None
-        if out_name in self.xrds:
-            coord_var = out_name
-        else:
-            sn = ce.get("standard_name", "")
-            if sn:
-                coord_var = self._find_var_by(standard_name=sn)
-
-        if coord_var is None:
-            messages.append(
-                f"Coordinate variable '{out_name}' (dim_id='{dim_id}') not found in file."
-            )
-            return out_of, score, messages
-        score += 1
-
-        if is_character:
-            # Character dimension coordinate: dims must be (out_name, strlen)
-            out_of += 1
-            dims = list(self.xrds[coord_var].dims)
-            if len(dims) != 2 or dims[1] != "strlen":
-                messages.append(
-                    f"Character coordinate '{coord_var}' must have dims "
-                    f"('{out_name}', 'strlen'); found {dims}."
-                )
-            else:
-                score += 1
-
-            # All requested string values must be present
-            if requested:
-                out_of += 1
-                try:
-                    raw = self.xrds[coord_var].values
-                    vals = [
-                        b"".join(row).decode("utf-8", errors="replace")
-                        .rstrip("\x00").strip()
-                        for row in raw
-                    ]
-                    missing = [r for r in requested if r not in vals]
-                    if missing:
-                        messages.append(
-                            f"Character coordinate '{coord_var}' is missing requested "
-                            f"value(s) {missing}; found {vals}."
-                        )
-                    else:
-                        score += 1
-                except Exception as exc:
-                    messages.append(
-                        f"Could not decode character coordinate '{coord_var}': {exc}"
-                    )
-        else:
-            # Numeric dimension coordinate
-            tol_str = ce.get("tolerance", "")
-            tol = float(tol_str) if tol_str else 1e-6
-
-            # Check all requested values are present
-            if requested:
-                out_of += 1
-                try:
-                    file_vals = list(np.asarray(self.xrds[coord_var].values).flat)
-                    req_floats = [float(r) for r in requested]
-                    missing = [
-                        r for r in req_floats
-                        if not any(abs(r - fv) <= tol for fv in file_vals)
-                    ]
-                    if missing:
-                        messages.append(
-                            f"Coordinate '{coord_var}' is missing requested value(s) "
-                            f"{missing} (tolerance={tol})."
-                        )
-                    else:
-                        score += 1
-                except Exception as exc:
-                    messages.append(
-                        f"Could not check values of coordinate '{coord_var}': {exc}"
-                    )
-
-            # Check bounds if required
-            if must_have_bounds:
-                # Resolve bounds variable name
-                bnds_attr = self.xrds[coord_var].attrs.get("bounds", "")
-                bnds_name = bnds_attr if bnds_attr else f"{coord_var}_bnds"
-
-                out_of += 1
-                if not bnds_attr:
-                    messages.append(
-                        f"Coordinate '{coord_var}' must have a 'bounds' attribute "
-                        f"set to '{bnds_name}'."
-                    )
-                else:
-                    score += 1
-
-                out_of += 1
-                if bnds_name not in self.xrds:
-                    messages.append(
-                        f"Bounds variable '{bnds_name}' for '{coord_var}' not found."
-                    )
-                else:
-                    score += 1
-                    # bounds must have NO attributes
-                    out_of += 1
-                    if self.xrds[bnds_name].attrs:
-                        messages.append(
-                            f"Bounds variable '{bnds_name}' must have no attributes; "
-                            f"found {list(self.xrds[bnds_name].attrs.keys())}."
-                        )
-                    else:
-                        score += 1
-
-                    # Verify requested bound pairs are present
-                    if requested_bounds:
-                        out_of += 1
-                        try:
-                            file_bnds = np.asarray(self.xrds[bnds_name].values).reshape(-1, 2)
-                            req_pairs = list(zip(
-                                [float(requested_bounds[i]) for i in range(0, len(requested_bounds), 2)],
-                                [float(requested_bounds[i]) for i in range(1, len(requested_bounds), 2)],
-                            ))
-                            missing_pairs = [
-                                pair for pair in req_pairs
-                                if not any(
-                                    abs(pair[0] - fb[0]) <= tol
-                                    and abs(pair[1] - fb[1]) <= tol
-                                    for fb in file_bnds
-                                )
-                            ]
-                            if missing_pairs:
-                                messages.append(
-                                    f"Bounds '{bnds_name}' missing requested pair(s) "
-                                    f"{missing_pairs} (tolerance={tol})."
-                                )
-                            else:
-                                score += 1
-                        except Exception as exc:
-                            messages.append(
-                                f"Could not check bounds of '{coord_var}': {exc}"
-                            )
-
-        return out_of, score, messages
+        return [ctx.to_result()]
 
 
 # ---------------------------------------------------------------------------
@@ -1053,55 +846,239 @@ class AICC(BaseNCCheck):
 
 
 def _parse_formula_terms(ft_str: str) -> dict:
-    """Parse a CF formula_terms string like 'ap: ap b: b ps: ps'."""
-    result = {}
-    parts = ft_str.split()
-    i = 0
-    while i + 1 < len(parts):
-        if parts[i].endswith(":"):
-            result[parts[i].rstrip(":")] = parts[i + 1]
-            i += 2
-        else:
-            i += 1
-    return result
+    """Parse 'ap: ap b: b ps: ps' style formula_terms string."""
+    return {m.group(1): m.group(2) for m in re.finditer(r"(\w+)\s*:\s*(\w+)", ft_str)}
 
 
 def _find_formula_entry(formula_entries: dict, var_name: str, generic_id: str) -> dict:
     """Return the formula_terms table entry whose out_name and dimension match."""
     for entry in formula_entries.values():
-        if entry.get("out_name") == var_name and generic_id in entry.get("dimensions", ""):
+        if (entry.get("out_name") == var_name
+                and generic_id in entry.get("dimensions", "")):
             return entry
     return {}
 
 
-def _check_formula_var_attrs(xr_var, var_name: str, ft_entry: dict,
-                              out_of: int, score: int):
+def _check_formula_var_attrs(ctx: TestCtx, var, var_name: str, ft_entry: dict):
     """Spot-check units and standard_name of a formula-term variable."""
-    messages = []
     expected_units = ft_entry.get("units", "")
     expected_sn = ft_entry.get("standard_name", "")
-
     if expected_units:
-        out_of += 1
-        if xr_var.attrs.get("units", "") != expected_units:
-            messages.append(
-                f"Formula term variable '{var_name}' units="
-                f"'{xr_var.attrs.get('units', '')}', expected '{expected_units}'."
-            )
+        level, msg = _compare_units(_ncattr(var, "units"), expected_units)
+        if level == "fail":
+            ctx.add_failure(f"Formula term '{var_name}' units: {msg}")
         else:
-            score += 1
-
+            ctx.add_pass()
     if expected_sn:
-        out_of += 1
-        if xr_var.attrs.get("standard_name", "") != expected_sn:
-            messages.append(
-                f"Formula term variable '{var_name}' standard_name="
-                f"'{xr_var.attrs.get('standard_name', '')}', expected '{expected_sn}'."
+        if _ncattr(var, "standard_name") != expected_sn:
+            ctx.add_failure(
+                f"Formula term '{var_name}' standard_name="
+                f"'{_ncattr(var, 'standard_name')}'; expected '{expected_sn}'."
             )
         else:
-            score += 1
+            ctx.add_pass()
 
-    return out_of, score, messages
+
+def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
+                         ce: dict, value: str, is_character: bool,
+                         data_out_name: str,
+                         dim_coord_names: set, aux_coord_names: set):
+    """Check a scalar coordinate (dimensionless or strlen-only)."""
+    # Locate by exact out_name, fall back to standard_name search
+    coord_var_name = out_name if out_name in ds.variables else None
+    if coord_var_name is None:
+        expected_sn = ce.get("standard_name", "")
+        if expected_sn:
+            matches = ds.get_variables_by_attributes(standard_name=expected_sn)
+            if matches:
+                coord_var_name = matches[0].name
+
+    if coord_var_name is None:
+        ctx.add_failure(
+            f"Scalar coordinate '{out_name}' (dim_id='{dim_id}') not found in file."
+        )
+        return
+    ctx.add_pass()
+
+    coord_var = ds.variables[coord_var_name]
+
+    if is_character:
+        dims = list(coord_var.dimensions)
+        if dims != ["strlen"]:
+            ctx.add_failure(
+                f"Character scalar coordinate '{coord_var_name}' must have only "
+                f"dimension 'strlen'; found {dims}."
+            )
+        else:
+            ctx.add_pass()
+    else:
+        if coord_var.ndim != 0:
+            ctx.add_failure(
+                f"Scalar coordinate '{coord_var_name}' (dim_id='{dim_id}') must be "
+                f"dimensionless; found dims={list(coord_var.dimensions)}."
+            )
+        else:
+            ctx.add_pass()
+            if value:
+                try:
+                    actual = float(np.asarray(coord_var[...]).flat[0])
+                    if not np.isclose(actual, float(value), rtol=1e-5, atol=0):
+                        ctx.add_failure(
+                            f"Scalar coordinate '{coord_var_name}' value={actual}; "
+                            f"expected {float(value)}."
+                        )
+                    else:
+                        ctx.add_pass()
+                except (TypeError, ValueError):
+                    ctx.add_pass()
+
+    # Data variable must list the scalar coord in its 'coordinates' attribute
+    if data_out_name and data_out_name in ds.variables:
+        data_var = ds.variables[data_out_name]
+        coord_attr = _ncattr(data_var, "coordinates")
+        if out_name not in (coord_attr.split() if coord_attr else []):
+            ctx.add_failure(
+                f"'{data_out_name}' 'coordinates' attribute must include scalar "
+                f"coordinate '{out_name}' (dim_id='{dim_id}'); "
+                f"current value: '{coord_attr}'."
+            )
+        else:
+            ctx.add_pass()
+
+
+def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
+                              requested: list, requested_bounds: list,
+                              must_have_bounds: bool, is_character: bool,
+                              expected_units: str, bnds_map: dict):
+    """Check a multi-value coordinate (requested values must be present in file)."""
+    import netCDF4 as nc4
+
+    coord_var_name = out_name if out_name in ds.variables else None
+    if coord_var_name is None:
+        sn = ce.get("standard_name", "")
+        if sn:
+            matches = ds.get_variables_by_attributes(standard_name=sn)
+            if matches:
+                coord_var_name = matches[0].name
+
+    if coord_var_name is None:
+        ctx.add_failure(f"Coordinate variable '{out_name}' not found in file.")
+        return
+    ctx.add_pass()
+
+    coord_var = ds.variables[coord_var_name]
+
+    if is_character:
+        # Dims must be (out_name, strlen)
+        dims = list(coord_var.dimensions)
+        if len(dims) != 2 or dims[1] != "strlen":
+            ctx.add_failure(
+                f"Character coordinate '{coord_var_name}' must have dims "
+                f"('{out_name}', 'strlen'); found {dims}."
+            )
+        else:
+            ctx.add_pass()
+
+        if requested:
+            try:
+                vals = [v.rstrip("\x00").strip()
+                        for v in nc4.chartostring(coord_var[:])]
+                missing = [r for r in requested if r not in vals]
+                if missing:
+                    ctx.add_failure(
+                        f"Character coordinate '{coord_var_name}' missing requested "
+                        f"value(s) {missing}; found {vals}."
+                    )
+                else:
+                    ctx.add_pass()
+            except Exception as exc:
+                ctx.add_failure(
+                    f"Could not decode character coordinate '{coord_var_name}': {exc}"
+                )
+    else:
+        tol_str = ce.get("tolerance", "")
+        tol = float(tol_str) if tol_str else 1e-6
+
+        # units via udunits
+        if expected_units:
+            level, msg = _compare_units(_ncattr(coord_var, "units"), expected_units)
+            if level == "fail":
+                ctx.add_failure(f"'{coord_var_name}' units: {msg}")
+            else:
+                ctx.add_pass()
+
+        if requested:
+            try:
+                file_vals = list(np.asarray(coord_var[:]).flat)
+                req_floats = [float(r) for r in requested]
+                missing = [
+                    r for r in req_floats
+                    if not any(abs(r - fv) <= tol for fv in file_vals)
+                ]
+                if missing:
+                    ctx.add_failure(
+                        f"'{coord_var_name}' missing requested value(s) "
+                        f"{missing} (tolerance={tol})."
+                    )
+                else:
+                    ctx.add_pass()
+            except Exception as exc:
+                ctx.add_failure(f"Could not check values of '{coord_var_name}': {exc}")
+
+        if must_have_bounds:
+            # cfutil-derived bounds map takes precedence
+            bnds_name = (bnds_map.get(coord_var_name)
+                         or _ncattr(coord_var, "bounds")
+                         or f"{coord_var_name}_bnds")
+            declared_bnds = _ncattr(coord_var, "bounds")
+            if not declared_bnds:
+                ctx.add_failure(
+                    f"'{coord_var_name}' must have a 'bounds' attribute "
+                    f"set to '{bnds_name}'."
+                )
+            else:
+                ctx.add_pass()
+
+            if bnds_name not in ds.variables:
+                ctx.add_failure(
+                    f"Bounds variable '{bnds_name}' for '{coord_var_name}' not found."
+                )
+            else:
+                ctx.add_pass()
+                bnds_var = ds.variables[bnds_name]
+                if bnds_var.ncattrs():
+                    ctx.add_failure(
+                        f"'{bnds_name}' must have no attributes; "
+                        f"found {list(bnds_var.ncattrs())}."
+                    )
+                else:
+                    ctx.add_pass()
+
+                if requested_bounds:
+                    try:
+                        file_bnds = np.asarray(bnds_var[:]).reshape(-1, 2)
+                        req_pairs = list(zip(
+                            [float(requested_bounds[i]) for i in range(0, len(requested_bounds), 2)],
+                            [float(requested_bounds[i]) for i in range(1, len(requested_bounds), 2)],
+                        ))
+                        missing_pairs = [
+                            pair for pair in req_pairs
+                            if not any(
+                                abs(pair[0] - fb[0]) <= tol and abs(pair[1] - fb[1]) <= tol
+                                for fb in file_bnds
+                            )
+                        ]
+                        if missing_pairs:
+                            ctx.add_failure(
+                                f"'{bnds_name}' missing requested bound pair(s) "
+                                f"{missing_pairs} (tolerance={tol})."
+                            )
+                        else:
+                            ctx.add_pass()
+                    except Exception as exc:
+                        ctx.add_failure(
+                            f"Could not check bounds of '{coord_var_name}': {exc}"
+                        )
 
 
 def _as_list(val) -> list:
@@ -1110,12 +1087,9 @@ def _as_list(val) -> list:
         return []
     if isinstance(val, list):
         return [v for v in val if v != ""]
-    if isinstance(val, str):
-        return [val] if val else []
-    return list(val)
+    return [val] if isinstance(val, str) and val else list(val)
 
 
 def _is_scalar_coord(ce: dict) -> bool:
-    """Return True if the coordinate entry represents a scalar in the file."""
-    requested = _as_list(ce.get("requested", []))
-    return not requested  # no requested list → scalar (value may or may not be set)
+    """True if the coordinate entry represents a scalar (no multi-value list)."""
+    return not bool(_as_list(ce.get("requested", [])))
