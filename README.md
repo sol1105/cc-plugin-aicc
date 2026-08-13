@@ -1,18 +1,22 @@
 # cc-plugin-aicc
 
-AWI ICON Coordinate Checker (AICC) — compliance_checker plugin for
-[CMIP7](https://wcrp-cmip.org/cmip7/) coordinate verification on AWI and ICON
-model output on configured horizontal grid types.
+AWI-ESM and ICON-XPP Coordinate Checker (AICC) — compliance_checker plugin for
+[CMIP7](https://wcrp-cmip.org/cmip7/) coordinate verification on AWI-ESM and
+ICON-XPP model output using configured horizontal grids and vertical coordinate
+systems.
+
+This plugin has been developed with heavy AI support as an intermediate solution
+until `cc-plugin-wcrp` provides general support for coordinate checks.
 
 ## Overview
 
 The plugin resolves the `branded_variable` global attribute against the CMIP7
-CMOR tables, identifies which coordinates are required, and runs four
+CMOR tables, identifies which coordinates are required, and runs several
 targeted checks:
 
 | Check | What is verified |
 |---|---|
-| `check_grid` | Unstructured lat/lon auxiliary coordinates, vertices bounds |
+| `check_grid` | Rectilinear or unstructured latitude/longitude coordinates and bounds |
 | `check_vertical` | Generic vertical levels (alevel/alevhalf/olevel/olevhalf), formula_terms |
 | `check_time` | Time axis, units, calendar, bounds / CF climatology |
 | `check_coord` | All other coordinates: scalar, character scalar, multi-value numeric/character |
@@ -20,15 +24,23 @@ targeted checks:
 | `check_coordinates_attribute` | No unexpected entries in the data variable's `coordinates` attribute |
 | `check_quantization` | CF-1.12 lossy quantization metadata and precision parameters |
 
-AWI model output uses `alternate_hybrid_sigma` / `alternate_hybrid_sigma_half`
-for atmospheric levels; ICON uses `modified_sleve_model_level` /
-`modified_sleve_half_level`. Both use `depth_coord` / `depth_coord_half` for
-ocean levels. Detection is automatic via the `source_id` global attribute.
+Further models can be configured through the `model_config` checker option or by
+extending the defaults in `config.py`.
+
+Currently, AWI-ESM is configured to verify `alternate_hybrid_sigma` /
+`alternate_hybrid_sigma_half` for atmospheric levels; ICON-XPP is configured to
+verify `modified_sleve_model_level` / `modified_sleve_half_level`. Both use
+`depth_coord` / `depth_coord_half` for ocean levels. Detection is automatic via
+the `source_id` global attribute.
+
+Horizontal grids are configured for each model via the `grid_label`. Currently,
+`"rectilinear"` and `"unstructured"` are supported, and additional grid types can
+be added.
 
 ## Requirements
 
 * Python ≥ 3.10
-* [compliance-checker](https://github.com/ioos/compliance-checker) ≥ 5.1.2
+* [compliance-checker](https://github.com/ioos/compliance-checker) ≥ 6.1.0
 * CMIP7 CMOR tables (JSON files)
 
 ## Installation
@@ -41,11 +53,11 @@ pip install -e .
 
 ```bash
 # point to CMIP7 tables via option
-compliance-checker -t aicc --options tables:/path/to/cmip7-cmor-tables/tables myfile.nc
+compliance-checker -t aicc -c strict --options tables:/path/to/cmip7-cmor-tables/tables myfile.nc
 
 # or set the environment variable
 export CMIP7_TABLES_PATH=/path/to/cmip7-cmor-tables/tables
-compliance-checker -t aicc myfile.nc
+compliance-checker -t aicc -c strict myfile.nc
 ```
 
 The `tables` option (or `CMIP7_TABLES_PATH` environment variable) must point

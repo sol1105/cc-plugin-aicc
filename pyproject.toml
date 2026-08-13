@@ -7,12 +7,13 @@ requires = [
 
 [project]
 name = "cc-plugin-aicc"
-description = "Compliance Checker plugin for CMIP7 coordinate checks on AWI/ICON unstructured model output"
+description = "Compliance Checker plugin for CMIP7 coordinate validation on configured model grids"
 readme = "README.md"
 keywords = ["compliance checker", "plugin", "cmip7", "awi", "icon", "coordinates"]
 license = {file = "LICENSE"}
 authors = [
-  {name = "Martin Schupfner", email = "schupfner@dkrz.de"}
+  {name = "Martin Schupfner", email = "schupfner@dkrz.de"},
+  {name = "Swarnalee Mazumder", email = "mazumder@dkrz.de"}
 ]
 maintainers = [
   {name = "Martin Schupfner", email = "schupfner@dkrz.de"}
@@ -27,7 +28,7 @@ classifiers = [
 ]
 dependencies = [
   "cftime",
-  "compliance-checker>=5.1.2",
+  "compliance-checker>=6.1.0",
   "netCDF4",
   "numpy",
   "xarray"
