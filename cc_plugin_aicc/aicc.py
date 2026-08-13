@@ -23,6 +23,7 @@ from cc_plugin_aicc.config import (
     HORIZONTAL_DIM_IDS,
     REALM_TO_TABLE,
     VERTICAL_GENERIC_IDS,
+    load_grid_config,
     load_model_config,
     resolve_grid_type,
     resolve_model_config,
@@ -55,7 +56,7 @@ class AICC(BaseNCCheck, BaseCheck):
     _cc_spec_version = __version__
     _cc_description = (
         "AWI ICON Coordinate Checks (AICC) — verifies CMIP7 coordinate compliance "
-        "for AWI/ICON unstructured model output."
+        "for configured model grids."
     )
     _cc_url = ""
     _cc_display_headers = {3: "Required", 2: "Recommended", 1: "Suggested"}
@@ -92,29 +93,27 @@ class AICC(BaseNCCheck, BaseCheck):
         tables_path = self.options.get("tables", DEFAULT_TABLES_PATH)
         self._read_cmip7_tables(tables_path)
 
-        # Load model config and resolve vertical mapping + grid type for this file
+        # Resolve the model-specific vertical mapping.
         source_id = _ncattr(dataset, "source_id")
         mc_opt = self.options.get("model_config", self.options.get("vertical_config"))
         model_config = load_model_config(mc_opt)
 
         self._conf_key, model_conf = resolve_model_config(source_id, model_config)
         if model_conf:
-            # Support both new format ("vertical"/"horizontal" keys)
-            # and legacy flat format ({"alevel": "...", ...})
-            if "vertical" in model_conf or "horizontal" in model_conf:
+            # Support both nested and legacy flat vertical configurations.
+            if "vertical" in model_conf:
                 self._vert_mapping = model_conf.get("vertical") or {}
-                h_conf = model_conf.get("horizontal") or {}
             else:
                 self._vert_mapping = model_conf
-                h_conf = {}
-            grid_label = _ncattr(dataset, "grid_label")
-            self._grid_type, self._grid_type_known = resolve_grid_type(h_conf, grid_label)
-            self._grid_label = grid_label
         else:
             self._vert_mapping = None
-            self._grid_type = "unstructured"
-            self._grid_type_known = True
-            self._grid_label = _ncattr(dataset, "grid_label")
+
+        # Resolve the globally registered grid_label independently of source_id.
+        self._grid_label = _ncattr(dataset, "grid_label")
+        grid_config = load_grid_config(self.options.get("grid_config"))
+        self._grid_type, self._grid_type_known = resolve_grid_type(
+            self._grid_label, grid_config
+        )
 
         # Identify variable and its CMOR table entry
         self.branded_variable = _ncattr(dataset, "branded_variable") or None
@@ -230,7 +229,7 @@ class AICC(BaseNCCheck, BaseCheck):
     # ------------------------------------------------------------------
 
     def check_grid(self, ds):
-        """Verify horizontal grid coordinates (unstructured or rectilinear)."""
+        """Verify horizontal coordinates for a registered grid topology."""
         has_lat = "latitude" in self.requested_dims
         has_lon = "longitude" in self.requested_dims
         if not (has_lat or has_lon):
@@ -245,11 +244,9 @@ class AICC(BaseNCCheck, BaseCheck):
             ctx = TestCtx(BaseCheck.HIGH, "[AICC002] Horizontal grid type")
             ctx.add_failure(
                 f"grid_label={_format_attribute(self._grid_label)} is not "
-                f"configured for model "
-                f"'{self._conf_key}'. Add it to the 'horizontal' section of "
-                f"'model_config' (using that grid label as a key with value "
-                f"\"unstructured\" "
-                f"or \"rectilinear\")."
+                f"registered in the global grid configuration. Add it to "
+                f"DEFAULT_GRID_CONFIG or pass a custom registry through the "
+                f"'grid_config' option."
             )
             return [ctx.to_result()]
 
@@ -582,14 +579,7 @@ class AICC(BaseNCCheck, BaseCheck):
             return [ctx.to_result()]
 
         if self._vert_mapping is None:
-            ctx = TestCtx(BaseCheck.HIGH, "[AICC003] Vertical coordinates")
-            source_id = _ncattr(ds, "source_id")
-            ctx.add_failure(
-                f"source_id {_format_attribute(source_id)} did not match any "
-                f"entry in the model "
-                f"configuration. Add a matching key to 'model_config' or pass a "
-                f"custom config via the 'model_config' option."
-            )
+            ctx = _vertical_config_ctx(ds, "[AICC003] Vertical coordinates")
             return [ctx.to_result()]
 
         results = []
@@ -985,6 +975,15 @@ class AICC(BaseNCCheck, BaseCheck):
 
         if self.var_entry is None:
             ctx.add_failure("Cannot check dimensions: CMOR table entry not resolved.")
+            return [ctx.to_result()]
+
+        if (
+            any(dim_id in VERTICAL_GENERIC_IDS for dim_id in self.requested_dims)
+            and self._vert_mapping is None
+        ):
+            ctx = _vertical_config_ctx(
+                ds, "[AICC006] Variable dimension ordering"
+            )
             return [ctx.to_result()]
 
         data_out_name = self.var_entry.get("out_name", "")
@@ -1387,6 +1386,19 @@ class AICC(BaseNCCheck, BaseCheck):
 
 
 
+
+
+def _vertical_config_ctx(ds, name: str) -> TestCtx:
+    """Return the common prerequisite failure for model-specific Z checks."""
+    ctx = TestCtx(BaseCheck.HIGH, name)
+    source_id = _ncattr(ds, "source_id")
+    ctx.add_failure(
+        f"Vertical checks cannot run because source_id "
+        f"{_format_attribute(source_id)} is not registered in the model "
+        f"configuration. Add a matching source_id key to the default "
+        f"configuration or pass it through the 'model_config' option."
+    )
+    return ctx
 
 
 def _check_formula_var_attrs(ctx: TestCtx, var, var_name: str, ft_entry: dict):

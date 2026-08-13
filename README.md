@@ -25,7 +25,7 @@ targeted checks:
 | `check_quantization` | CF-1.12 lossy quantization metadata and precision parameters |
 
 Further models can be configured through the `model_config` checker option or by
-extending the defaults in `config.py`.
+extending the vertical defaults in `config.py`.
 
 Currently, AWI-ESM is configured to verify `alternate_hybrid_sigma` /
 `alternate_hybrid_sigma_half` for atmospheric levels; ICON-XPP is configured to
@@ -33,9 +33,12 @@ verify `modified_sleve_model_level` / `modified_sleve_half_level`. Both use
 `depth_coord` / `depth_coord_half` for ocean levels. Detection is automatic via
 the `source_id` global attribute.
 
-Horizontal grids are configured for each model via the `grid_label`. Currently,
-`"rectilinear"` and `"unstructured"` are supported, and additional grid types can
-be added.
+CMIP7 `grid_label` values are registered globally rather than per model. All
+currently registered labels from `g100` through `g236` are classified as
+`"rectilinear"`, `"unstructured"`, or `"curvilinear"`. Coordinate validation is
+currently implemented for rectilinear and unstructured grids; curvilinear labels
+are recognized and reported as not yet implemented. The registry can be replaced
+through the `grid_config` checker option or extended in `config.py`.
 
 ## Requirements
 
