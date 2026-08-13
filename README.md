@@ -2,7 +2,7 @@
 
 AWI ICON Coordinate Checker (AICC) — compliance_checker plugin for
 [CMIP7](https://wcrp-cmip.org/cmip7/) coordinate verification on AWI and ICON
-model output that uses unstructured horizontal grids.
+model output on configured horizontal grid types.
 
 ## Overview
 
@@ -17,6 +17,8 @@ targeted checks:
 | `check_time` | Time axis, units, calendar, bounds / CF climatology |
 | `check_coord` | All other coordinates: scalar, character scalar, multi-value numeric/character |
 | `check_dimensions` | C-order dimension ordering of the data variable |
+| `check_coordinates_attribute` | No unexpected entries in the data variable's `coordinates` attribute |
+| `check_quantization` | CF-1.12 lossy quantization metadata and precision parameters |
 
 AWI model output uses `alternate_hybrid_sigma` / `alternate_hybrid_sigma_half`
 for atmospheric levels; ICON uses `modified_sleve_model_level` /

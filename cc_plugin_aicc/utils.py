@@ -13,8 +13,24 @@ from compliance_checker.cf import util as cfutil
 
 # Adapted from swarnaleem's attr() — github.com/swarnaleem/cc-plugin-wcrp
 # feature/coordinate-standard db0791d plugins/coordinate_standard/classify.py
+def _format_attribute(value) -> str:
+    """Format an attribute safely for a one-line finding message."""
+    if not isinstance(value, str):
+        return repr(value)
+
+    has_control_whitespace = any(char in value for char in "\t\r\n")
+    displayed = " ".join(value.split()) if has_control_whitespace else value
+    formatted = repr(displayed)
+    if has_control_whitespace:
+        formatted += (
+            " (Note: tab or newline characters were found and removed "
+            "from this message.)"
+        )
+    return formatted
+
+
 def _ncattr(var_or_ds, name: str, default=""):
-    """Safe attribute read for both netCDF4 variables and Datasets."""
+    """Read an attribute safely without altering its value."""
     return getattr(var_or_ds, name, default) or default
 
 
@@ -41,7 +57,7 @@ def _compare_units(candidate_units: str, entry_units: str) -> tuple:
     if not entry_units:
         return "ok", ""
     if not candidate_units:
-        return "warn", f"units missing; table expects '{entry_units}'"
+        return "warn", f"units missing; table expects {_format_attribute(entry_units)}"
     if candidate_units == entry_units:
         return "ok", ""
     if "?" in entry_units:
@@ -52,14 +68,24 @@ def _compare_units(candidate_units: str, entry_units: str) -> tuple:
             entry_base = entry_units.split(" since ")[0]
             cand_base = candidate_units.split(" since ")[0]
             if cfutil.units_convertible(cand_base, entry_base):
-                return "warn", (f"units '{candidate_units}' use base unit "
-                                f"'{cand_base}'; table expects '{entry_base}'")
-        return "fail", (f"units '{candidate_units}' do not match the table "
-                        f"template '{entry_units}'")
+                return "warn", (
+                    f"units {_format_attribute(candidate_units)} use base unit "
+                    f"{_format_attribute(cand_base)}; table expects "
+                    f"{_format_attribute(entry_base)}"
+                )
+        return "fail", (
+            f"units {_format_attribute(candidate_units)} do not match the table "
+            f"template {_format_attribute(entry_units)}"
+        )
     if cfutil.units_convertible(candidate_units, entry_units):
-        return "warn", (f"units '{candidate_units}' convertible to but not "
-                        f"identical to table units '{entry_units}'")
-    return "fail", f"units '{candidate_units}' not convertible to '{entry_units}'"
+        return "warn", (
+            f"units {_format_attribute(candidate_units)} convertible to but not "
+            f"identical to table units {_format_attribute(entry_units)}"
+        )
+    return "fail", (
+        f"units {_format_attribute(candidate_units)} not convertible to "
+        f"{_format_attribute(entry_units)}"
+    )
 
 
 def _is_time_dim(dim_id: str) -> bool:
@@ -76,8 +102,8 @@ def _as_list(val) -> list:
 
 
 def _is_scalar_coord(ce: dict) -> bool:
-    """True if the coordinate entry represents a scalar (no multi-value list)."""
-    return not bool(_as_list(ce.get("requested", [])))
+    """True if the coordinate table entry prescribes a scalar value or bounds."""
+    return bool(ce.get("value") or ce.get("bounds_values"))
 
 
 def _decode_char_var(var) -> list:

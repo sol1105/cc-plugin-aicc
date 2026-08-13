@@ -41,7 +41,8 @@ REALM_TO_TABLE = {
 # Structure: source_id_substring -> {"vertical": {...}, "horizontal": {...}}
 #
 # vertical:   generic_level_id  -> CMIP7_coordinate.json axis_entry key
-# horizontal: grid_label        -> "unstructured" | "rectilinear"
+# horizontal: grid_label        -> registered grid type
+#                                (currently "unstructured" or "rectilinear")
 #             "default"         -> fallback when no exact grid_label match
 #
 # Longer (more-specific) source_id keys take precedence over shorter ones,
@@ -59,31 +60,14 @@ DEFAULT_CONFIG = {
         },
         "horizontal": {
             "default": "unstructured",
-        },
-    },
-    "AWI": {
-        "vertical": {
-            "alevel": "alternate_hybrid_sigma",
-            "alevhalf": "alternate_hybrid_sigma_half",
-            "olevel": "depth_coord",
-            "olevhalf": "depth_coord_half",
-        },
-        "horizontal": {
-            "default": "unstructured",
+            "g132": "unstructured",
+            "g130": "unstructured",
+            "g129": "rectilinear",
+            "g122": "unstructured",
+            "g113": "rectilinear",
         },
     },
     "ICON-XPP": {
-        "vertical": {
-            "alevel": "modified_sleve_model_level",
-            "alevhalf": "modified_sleve_half_level",
-            "olevel": "depth_coord",
-            "olevhalf": "depth_coord_half",
-        },
-        "horizontal": {
-            "default": "unstructured",
-        },
-    },
-    "ICON": {
         "vertical": {
             "alevel": "modified_sleve_model_level",
             "alevhalf": "modified_sleve_half_level",
