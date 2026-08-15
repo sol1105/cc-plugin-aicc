@@ -3,7 +3,7 @@
 AWI-ESM and ICON-XPP Coordinate Checker (AICC) — compliance_checker plugin for
 [CMIP7](https://wcrp-cmip.org/cmip7/) coordinate verification on AWI-ESM and
 ICON-XPP model output using configured horizontal grids and vertical coordinate
-systems.
+systems. Other modeling systems could be configured if required.
 
 This plugin has been developed with heavy AI support as an intermediate solution
 until `cc-plugin-wcrp` provides general support for coordinate checks.
