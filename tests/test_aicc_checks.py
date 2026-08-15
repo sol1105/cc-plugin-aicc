@@ -51,6 +51,21 @@ RHO_ENTRY = {
     "bounds_values": "",
 }
 
+UNSTRUCTURED_GRID_ENTRIES = {
+    "latitude": {
+        "out_name": "latitude",
+        "standard_name": "latitude",
+        "long_name": "latitude",
+        "units": "degrees_north",
+    },
+    "vertices_latitude": {
+        "out_name": "vertices_latitude",
+        "standard_name": "",
+        "long_name": "",
+        "units": "degrees_north",
+    },
+}
+
 
 @contextmanager
 def _open_netcdf(tmp_path, name, dataset):
@@ -405,4 +420,65 @@ def test_coordinates_attribute_still_reports_unrelated_entries_for_unknown_grid(
     assert any(
         "not requested auxiliary or scalar coordinates: ['rogue']" in message
         for message in _messages(results, BaseCheck.LOW)
+    )
+
+
+def _unstructured_latitude_dataset(vertex_units=None):
+    dataset = xr.Dataset(
+        data_vars={
+            "tas": (("cell",), [280.0, 281.0]),
+            "vertices_latitude": (
+                ("cell", "vertex"),
+                [[-50.0, -45.0, -40.0], [40.0, 45.0, 50.0]],
+            ),
+        },
+        coords={"latitude": ("cell", [-45.0, 45.0])},
+    )
+    dataset["latitude"].attrs.update(
+        {
+            "standard_name": "latitude",
+            "long_name": "latitude",
+            "units": "degrees_north",
+        }
+    )
+    dataset["tas"].attrs["coordinates"] = "latitude"
+    if vertex_units is not None:
+        dataset["vertices_latitude"].attrs["units"] = vertex_units
+    return dataset
+
+
+def _unstructured_grid_checker():
+    checker = _checker(
+        ["latitude"],
+        {},
+        var_entry={"out_name": "tas"},
+    )
+    checker.CTgrids = {"variable_entry": UNSTRUCTURED_GRID_ENTRIES}
+    checker._grid_type = "unstructured"
+    checker._grid_type_known = True
+    return checker
+
+
+@pytest.mark.parametrize("vertex_units", [None, "degrees_north"])
+def test_vertex_bounds_attributes_are_optional(tmp_path, vertex_units):
+    dataset = _unstructured_latitude_dataset(vertex_units)
+
+    with _open_netcdf(tmp_path, "optional_vertex_attributes", dataset) as nc:
+        results = _unstructured_grid_checker().check_grid(nc)
+
+    assert not any(
+        "vertices_latitude" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_vertex_bounds_reports_an_incorrect_attribute(tmp_path):
+    dataset = _unstructured_latitude_dataset("radians")
+
+    with _open_netcdf(tmp_path, "incorrect_vertex_attributes", dataset) as nc:
+        results = _unstructured_grid_checker().check_grid(nc)
+
+    assert any(
+        "'vertices_latitude' units:" in message
+        for message in _messages(results, BaseCheck.HIGH)
     )

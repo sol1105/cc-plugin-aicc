@@ -373,7 +373,12 @@ class AICC(BaseNCCheck, BaseCheck):
 
             # Attributes from CMIP7_grids.json
             _check_coord_attrs(
-                vtx_ctx, vtx_low_ctx, vtx_var, vtx_var_name, vtx_entry
+                vtx_ctx,
+                vtx_low_ctx,
+                vtx_var,
+                vtx_var_name,
+                vtx_entry,
+                missing_ok=True,
             )
 
             if vtx_var.ndim != 2:
@@ -384,11 +389,18 @@ class AICC(BaseNCCheck, BaseCheck):
             else:
                 vtx_ctx.add_pass()
 
-            level, msg = _compare_units(_ncattr(vtx_var, "units"), vtx_expected_units)
-            if level != "ok":
-                vtx_ctx.add_failure(f"'{vtx_var_name}' units: {msg}")
-            else:
+            vtx_units = _ncattr(vtx_var, "units")
+            if not vtx_units:
+                # CF bounds variables normally inherit coordinate metadata and
+                # should not duplicate it. CMOR-listed vertex attributes are
+                # therefore optional, but must be correct when supplied.
                 vtx_ctx.add_pass()
+            else:
+                level, msg = _compare_units(vtx_units, vtx_expected_units)
+                if level != "ok":
+                    vtx_ctx.add_failure(f"'{vtx_var_name}' units: {msg}")
+                else:
+                    vtx_ctx.add_pass()
 
             results.append(vtx_ctx.to_result())
             if vtx_low_ctx.messages:
@@ -2023,12 +2035,15 @@ def _check_coord_attrs(
     var,
     var_name: str,
     ce: dict,
+    missing_ok: bool = False,
 ):
-    """Check required standard_name and advisory long_name attributes."""
+    """Check standard_name and advisory long_name attributes."""
     expected_sn = ce.get("standard_name", "")
     if expected_sn:
         actual_sn = _ncattr(var, "standard_name")
-        if actual_sn != expected_sn:
+        if missing_ok and not actual_sn:
+            ctx.add_pass()
+        elif actual_sn != expected_sn:
             ctx.add_failure(
                 f"'{var_name}' standard_name={_format_attribute(actual_sn)}; "
                 f"expected '{expected_sn}'."
@@ -2039,7 +2054,12 @@ def _check_coord_attrs(
     expected_ln = ce.get("long_name", "")
     if expected_ln:
         actual_ln = _ncattr(var, "long_name")
-        if actual_ln != expected_ln:
+        if actual_ln and actual_ln != expected_ln:
+            low_ctx.add_failure(
+                f"'{var_name}' long_name={_format_attribute(actual_ln)}; "
+                f"expected '{expected_ln}'."
+            )
+        elif not actual_ln and not missing_ok:
             low_ctx.add_failure(
                 f"'{var_name}' long_name={_format_attribute(actual_ln)}; "
                 f"expected '{expected_ln}'."
