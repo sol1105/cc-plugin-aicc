@@ -339,3 +339,70 @@ def test_stored_direction_applies_without_physical_positive_semantics(tmp_path):
     messages = _messages(results, BaseCheck.HIGH)
     assert any("not strictly increasing" in message for message in messages)
     assert not any("positive=" in message for message in messages)
+
+
+def _horizontal_dataset(coordinates="latitude longitude"):
+    dataset = xr.Dataset(
+        data_vars={
+            "ta": (
+                ("time", "latitude", "longitude"),
+                np.zeros((1, 2, 3), dtype="float32"),
+            )
+        },
+        coords={
+            "time": ("time", [0.0]),
+            "latitude": ("latitude", [-45.0, 45.0]),
+            "longitude": ("longitude", [0.0, 120.0, 240.0]),
+        },
+    )
+    dataset["latitude"].attrs.update(
+        {"standard_name": "latitude", "units": "degrees_north", "axis": "Y"}
+    )
+    dataset["longitude"].attrs.update(
+        {"standard_name": "longitude", "units": "degrees_east", "axis": "X"}
+    )
+    dataset["ta"].attrs["coordinates"] = coordinates
+    return dataset
+
+
+def _unknown_grid_checker():
+    checker = _checker(
+        ["longitude", "latitude", "time"],
+        {},
+        var_entry={"out_name": "ta"},
+    )
+    checker._grid_type = None
+    checker._grid_type_known = False
+    return checker
+
+
+def test_dimensions_silently_skips_an_unresolved_horizontal_grid(tmp_path):
+    with _open_netcdf(tmp_path, "unknown_grid_dimensions", _horizontal_dataset()) as nc:
+        results = _unknown_grid_checker().check_dimensions(nc)
+
+    assert _messages(results, BaseCheck.HIGH) == []
+
+
+def test_coordinates_attribute_allows_horizontal_coordinates_for_unknown_grid(
+    tmp_path,
+):
+    dataset = _horizontal_dataset()
+
+    with _open_netcdf(tmp_path, "unknown_grid_coordinates", dataset) as nc:
+        results = _unknown_grid_checker().check_coordinates_attribute(nc)
+
+    assert _messages(results, BaseCheck.LOW) == []
+
+
+def test_coordinates_attribute_still_reports_unrelated_entries_for_unknown_grid(
+    tmp_path,
+):
+    dataset = _horizontal_dataset("latitude longitude rogue")
+
+    with _open_netcdf(tmp_path, "unknown_grid_extra_coordinate", dataset) as nc:
+        results = _unknown_grid_checker().check_coordinates_attribute(nc)
+
+    assert any(
+        "not requested auxiliary or scalar coordinates: ['rogue']" in message
+        for message in _messages(results, BaseCheck.LOW)
+    )

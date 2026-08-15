@@ -1271,11 +1271,10 @@ class AICC(BaseNCCheck, BaseCheck):
         if horizontal_dim_ids:
             handler = self._grid_type_handlers.get(self._grid_type)
             if handler is None:
-                ctx.add_failure(
-                    f"Cannot determine expected dimensions for unsupported grid "
-                    f"type '{self._grid_type}'. Supported grid types: "
-                    f"{sorted(self._grid_type_handlers)}."
-                )
+                # AICC002 already reports an unknown or unsupported grid type.
+                # Without its topology, no horizontal dimension ordering can be
+                # inferred reliably, so avoid a derivative AICC006 finding.
+                ctx.add_pass()
                 return [ctx.to_result()]
             horizontal_entries = self._grid_table_entries(handler)
             expected_horizontal = getattr(self, handler["dimensions"])(
@@ -1355,8 +1354,22 @@ class AICC(BaseNCCheck, BaseCheck):
         allowed_coordinates = set()
         axis_entries = self.CTcoords.get("axis_entry", {})
 
+        grid_handler = self._grid_type_handlers.get(self._grid_type)
+        if grid_handler is None:
+            # AICC002 owns the unknown/unsupported grid-type finding. Until the
+            # topology is known, latitude and longitude cannot reliably be
+            # classified as dimension or auxiliary coordinates. Conservatively
+            # allow CF-detected horizontal coordinates here while still checking
+            # every other entry in the coordinates attribute.
+            for dim_id, candidates in (
+                ("latitude", cfutil.get_true_latitude_variables(ds)),
+                ("longitude", cfutil.get_true_longitude_variables(ds)),
+            ):
+                if dim_id in self.requested_dims:
+                    allowed_coordinates.update(candidates)
+
         # Unstructured horizontal coordinates are auxiliary coordinates.
-        if self._grid_type == "unstructured":
+        elif self._grid_type == "unstructured":
             dim_coord_names = set(cfutil.get_coordinate_variables(ds))
             for dim_id, candidates in (
                 ("latitude", cfutil.get_true_latitude_variables(ds)),
