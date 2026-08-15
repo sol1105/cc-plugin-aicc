@@ -16,10 +16,13 @@ targeted checks:
 
 | Check | What is verified |
 |---|---|
+| `check_branded_variable` | Identification of the requested variable in the CMIP7 tables |
 | `check_grid` | Rectilinear or unstructured latitude/longitude coordinates and bounds |
 | `check_vertical` | Generic vertical levels (alevel/alevhalf/olevel/olevhalf), formula_terms |
+| `check_vertical_direction` | Stored and formula-derived direction of generic vertical levels |
 | `check_time` | Time axis, units, calendar, bounds / CF climatology |
 | `check_coord` | All other coordinates: scalar, character scalar, multi-value numeric/character |
+| `check_coordinate_direction` | Stored direction of 1-D coordinates; physical direction of pressure, height, and depth |
 | `check_dimensions` | C-order dimension ordering of the data variable |
 | `check_coordinates_attribute` | No unexpected entries in the data variable's `coordinates` attribute |
 | `check_quantization` | CF-1.12 lossy quantization metadata and precision parameters |
@@ -48,15 +51,25 @@ through the `grid_config` checker option or extended in `config.py`.
 
 ## Installation
 
+- Directly from GitHub:
+
 ```bash
-pip install -e .
+python -m pip install "cc-plugin-aicc @ git+https://github.com/sol1105/cc-plugin-aicc.git@main"
+```
+
+- From a local source checkout:
+
+```bash
+python -m pip install -e .
 ```
 
 ## Usage
 
 ```bash
 # point to CMIP7 tables via option
-compliance-checker -t aicc -c strict --options tables:/path/to/cmip7-cmor-tables/tables myfile.nc
+compliance-checker -t aicc -c strict \
+  --option aicc:tables:/path/to/cmip7-cmor-tables/tables \
+  myfile.nc
 
 # or set the environment variable
 export CMIP7_TABLES_PATH=/path/to/cmip7-cmor-tables/tables

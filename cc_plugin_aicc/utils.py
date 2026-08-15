@@ -49,15 +49,18 @@ def _neutral_dtype(var) -> str:
 # Adapted from swarnaleem's _compare_units() — github.com/swarnaleem/cc-plugin-wcrp
 # feature/coordinate-standard db0791d plugins/coordinate_standard/matching.py
 def _compare_units(candidate_units: str, entry_units: str) -> tuple:
-    """Tiered units comparison backed by udunits.
+    """Exact units comparison with udunits-backed conversion information.
 
-    Returns (level, message): 'ok', 'warn' (convertible but not identical),
-    or 'fail'. CMOR time templates like 'days since ?' accept any date.
+    Returns ``("ok", "")`` only for an exact table match. Missing, convertible,
+    and incompatible units all return ``("fail", message)``. CMOR time
+    templates such as ``days since ?`` accept any non-empty reference date.
     """
     if not entry_units:
         return "ok", ""
     if not candidate_units:
-        return "warn", f"units missing; table expects {_format_attribute(entry_units)}"
+        return "fail", (
+            f"units missing; table requires {_format_attribute(entry_units)}"
+        )
     if candidate_units == entry_units:
         return "ok", ""
     if "?" in entry_units:
@@ -68,19 +71,21 @@ def _compare_units(candidate_units: str, entry_units: str) -> tuple:
             entry_base = entry_units.split(" since ")[0]
             cand_base = candidate_units.split(" since ")[0]
             if cfutil.units_convertible(cand_base, entry_base):
-                return "warn", (
-                    f"units {_format_attribute(candidate_units)} use base unit "
-                    f"{_format_attribute(cand_base)}; table expects "
-                    f"{_format_attribute(entry_base)}"
+                return "fail", (
+                    f"units {_format_attribute(candidate_units)} do not match the "
+                    f"table template {_format_attribute(entry_units)}; base unit "
+                    f"{_format_attribute(cand_base)} is convertible to required "
+                    f"base unit {_format_attribute(entry_base)}"
                 )
         return "fail", (
             f"units {_format_attribute(candidate_units)} do not match the table "
             f"template {_format_attribute(entry_units)}"
         )
     if cfutil.units_convertible(candidate_units, entry_units):
-        return "warn", (
-            f"units {_format_attribute(candidate_units)} convertible to but not "
-            f"identical to table units {_format_attribute(entry_units)}"
+        return "fail", (
+            f"units {_format_attribute(candidate_units)} are convertible to "
+            f"required table units {_format_attribute(entry_units)} but are not "
+            f"identical"
         )
     return "fail", (
         f"units {_format_attribute(candidate_units)} not convertible to "

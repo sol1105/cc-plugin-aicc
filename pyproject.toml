@@ -41,7 +41,7 @@ dynamic = [
 aicc = "cc_plugin_aicc.aicc:AICC"
 
 [project.urls]
-repository = "https://github.com/euro-cordex/cc-plugin-aicc"
+repository = "https://github.com/sol1105/cc-plugin-aicc"
 
 [project.optional-dependencies]
 dev = [

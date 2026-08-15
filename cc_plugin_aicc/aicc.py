@@ -8,6 +8,7 @@ consistent CF-convention application. Configuration lives in config.py;
 pure utility functions live in utils.py.
 """
 
+import ast
 import json
 import os
 import re
@@ -285,6 +286,10 @@ class AICC(BaseNCCheck, BaseCheck):
                 continue
 
             ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {dim_id} auxiliary coordinate")
+            low_ctx = TestCtx(
+                BaseCheck.LOW,
+                f"[AICC002] {dim_id} auxiliary coordinate (advisory)",
+            )
             grid_entry = grid_entries.get(dim_id, {})
             expected_units = grid_entry.get("units", "")
             vtx_key = f"vertices_{dim_id}"
@@ -310,7 +315,7 @@ class AICC(BaseNCCheck, BaseCheck):
             aux_var = ds.variables[aux_var_name]
 
             # Attributes from CMIP7_grids.json
-            _check_coord_attrs(ctx, aux_var, aux_var_name, grid_entry)
+            _check_coord_attrs(ctx, low_ctx, aux_var, aux_var_name, grid_entry)
 
             # Must be 1-D (single unstructured cell dimension)
             if aux_var.ndim != 1:
@@ -334,15 +339,20 @@ class AICC(BaseNCCheck, BaseCheck):
 
             # Units via cfutil-backed comparison
             level, msg = _compare_units(_ncattr(aux_var, "units"), expected_units)
-            if level == "fail":
+            if level != "ok":
                 ctx.add_failure(f"'{aux_var_name}' units: {msg}")
             else:
                 ctx.add_pass()  # pass even for convertible (advisory only)
 
             results.append(ctx.to_result())
+            if low_ctx.messages:
+                results.append(low_ctx.to_result())
 
             # --- Vertex bounds ---
             vtx_ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {vtx_key}")
+            vtx_low_ctx = TestCtx(
+                BaseCheck.LOW, f"[AICC002] {vtx_key} (advisory)"
+            )
             # Look for the vertices variable by exact out_name or 'vertices_*' naming
             vtx_var_name = vtx_out_name if vtx_out_name in ds.variables else next(
                 (v for v in ds.variables
@@ -362,7 +372,9 @@ class AICC(BaseNCCheck, BaseCheck):
             vtx_var = ds.variables[vtx_var_name]
 
             # Attributes from CMIP7_grids.json
-            _check_coord_attrs(vtx_ctx, vtx_var, vtx_var_name, vtx_entry)
+            _check_coord_attrs(
+                vtx_ctx, vtx_low_ctx, vtx_var, vtx_var_name, vtx_entry
+            )
 
             if vtx_var.ndim != 2:
                 vtx_ctx.add_failure(
@@ -373,12 +385,14 @@ class AICC(BaseNCCheck, BaseCheck):
                 vtx_ctx.add_pass()
 
             level, msg = _compare_units(_ncattr(vtx_var, "units"), vtx_expected_units)
-            if level == "fail":
+            if level != "ok":
                 vtx_ctx.add_failure(f"'{vtx_var_name}' units: {msg}")
             else:
                 vtx_ctx.add_pass()
 
             results.append(vtx_ctx.to_result())
+            if vtx_low_ctx.messages:
+                results.append(vtx_low_ctx.to_result())
 
         # Data variable must list lat/lon in its 'coordinates' attribute
         data_out_name = self.var_entry.get("out_name", "") if self.var_entry else ""
@@ -456,6 +470,10 @@ class AICC(BaseNCCheck, BaseCheck):
             must_have_bounds = ce.get("must_have_bounds", "no") == "yes"
 
             ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {dim_id} dimension coordinate")
+            low_ctx = TestCtx(
+                BaseCheck.LOW,
+                f"[AICC002] {dim_id} dimension coordinate (advisory)",
+            )
 
             dim_matches = [
                 name for name in cf_vars if name in dim_coord_names
@@ -504,15 +522,17 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()
 
             # Attributes from CMIP7_coordinate.json
-            _check_coord_attrs(ctx, var, var_name, ce)
+            _check_coord_attrs(ctx, low_ctx, var, var_name, ce)
 
             level, msg = _compare_units(_ncattr(var, "units"), expected_units)
-            if level == "fail":
+            if level != "ok":
                 ctx.add_failure(f"'{var_name}' units: {msg}")
             else:
                 ctx.add_pass()
 
             results.append(ctx.to_result())
+            if low_ctx.messages:
+                results.append(low_ctx.to_result())
 
             if must_have_bounds:
                 expected_bnds_name = f"{expected_out_name}_bnds"
@@ -613,6 +633,11 @@ class AICC(BaseNCCheck, BaseCheck):
                 BaseCheck.HIGH,
                 f"[AICC003] Vertical coordinate '{out_name}' ({generic_id})",
             )
+            low_ctx = TestCtx(
+                BaseCheck.LOW,
+                f"[AICC003] Vertical coordinate '{out_name}' "
+                f"({generic_id}, advisory)",
+            )
 
             # Locate lev variable: exact out_name, then cfutil Z vars by standard_name
             if out_name in ds.variables:
@@ -643,12 +668,12 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()
 
             # Attributes from CMIP7_coordinate.json
-            _check_coord_attrs(ctx, lev_var, lev_var_name, ce)
+            _check_coord_attrs(ctx, low_ctx, lev_var, lev_var_name, ce)
 
             # units (via udunits-backed comparison)
             if expected_units:
                 level, msg = _compare_units(_ncattr(lev_var, "units"), expected_units)
-                if level == "fail":
+                if level != "ok":
                     ctx.add_failure(f"'{lev_var_name}' units: {msg}")
                 else:
                     ctx.add_pass()
@@ -715,9 +740,21 @@ class AICC(BaseNCCheck, BaseCheck):
                         f"(formula: '{ce.get('formula', '')}')."
                     )
                 else:
-                    ctx.add_pass()
+                    expected_ft_map = _parse_formula_terms(z_factors_str)
                     ft_map = _parse_formula_terms(ft_attr)
-                    for term, var_name in ft_map.items():
+                    if ft_map != expected_ft_map:
+                        ctx.add_failure(
+                            f"'{lev_var_name}' formula_terms="
+                            f"{_format_attribute(ft_attr)}; expected "
+                            f"{_format_attribute(z_factors_str)} from the CMOR "
+                            f"table."
+                        )
+                    else:
+                        ctx.add_pass()
+
+                    # Validate the CMOR-prescribed variables rather than allowing
+                    # divergent file metadata to select different inputs.
+                    for term, var_name in expected_ft_map.items():
                         if var_name not in ds.variables:
                             ctx.add_failure(
                                 f"formula_terms: term '{term}' references '{var_name}' "
@@ -730,7 +767,11 @@ class AICC(BaseNCCheck, BaseCheck):
                             )
                             if ft_entry:
                                 _check_formula_var_attrs(
-                                    ctx, ds.variables[var_name], var_name, ft_entry
+                                    ctx,
+                                    low_ctx,
+                                    ds.variables[var_name],
+                                    var_name,
+                                    ft_entry,
                                 )
 
             # bounds formula terms
@@ -749,8 +790,150 @@ class AICC(BaseNCCheck, BaseCheck):
                         )
                         if ft_entry:
                             _check_formula_var_attrs(
-                                ctx, ds.variables[var_name], var_name, ft_entry
+                                ctx,
+                                low_ctx,
+                                ds.variables[var_name],
+                                var_name,
+                                ft_entry,
                             )
+
+            results.append(ctx.to_result())
+            if low_ctx.messages:
+                results.append(low_ctx.to_result())
+
+        return results
+
+    # ------------------------------------------------------------------
+
+    def check_vertical_direction(self, ds):
+        """Verify stored and physical direction of generic vertical coordinates."""
+        vert_dims = [d for d in self.requested_dims if d in VERTICAL_GENERIC_IDS]
+        if not vert_dims:
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC003b] Vertical direction")
+            ctx.add_pass()
+            return [ctx.to_result()]
+
+        if self._vert_mapping is None:
+            ctx = _vertical_config_ctx(ds, "[AICC003b] Vertical direction")
+            return [ctx.to_result()]
+
+        results = []
+        axis_entries = self.CTcoords.get("axis_entry", {})
+        z_var_names = set(cfutil.get_z_variables(ds))
+
+        for generic_id in vert_dims:
+            ctx = TestCtx(
+                BaseCheck.HIGH,
+                f"[AICC003b] Vertical direction ({generic_id})",
+            )
+            coord_key = self._vert_mapping.get(generic_id)
+            if not coord_key:
+                ctx.add_failure(
+                    f"No vertical coordinate mapping for '{generic_id}' in "
+                    f"config entry '{self._conf_key}'."
+                )
+                results.append(ctx.to_result())
+                continue
+
+            ce = axis_entries.get(coord_key)
+            if ce is None:
+                ctx.add_failure(
+                    f"Configured vertical coordinate entry '{coord_key}' for "
+                    f"'{generic_id}' is absent from CMIP7_coordinate.json."
+                )
+                results.append(ctx.to_result())
+                continue
+
+            out_name = ce.get("out_name", "lev")
+            # Direction semantics come from the selected CMOR table entry.  The
+            # file's standard_name is checked separately by AICC003 and may be
+            # absent or incorrect, so it must not control this check.
+            table_standard_name = ce.get("standard_name", "")
+            if out_name in ds.variables:
+                var_name = out_name
+            else:
+                var_name = next(
+                    (
+                        name
+                        for name in z_var_names
+                        if table_standard_name
+                        and _ncattr(ds.variables[name], "standard_name")
+                        == table_standard_name
+                    ),
+                    None,
+                )
+
+            if var_name is None:
+                ctx.add_failure(
+                    f"Cannot check vertical direction for '{generic_id}': "
+                    f"coordinate '{out_name}' was not found."
+                )
+                results.append(ctx.to_result())
+                continue
+
+            coord_var = ds.variables[var_name]
+            stored_direction = ce.get("stored_direction", "")
+            if stored_direction:
+                _check_profile_direction(
+                    ctx,
+                    coord_var[:],
+                    stored_direction,
+                    f"Stored coordinate '{var_name}'",
+                    source_ndim=coord_var.ndim,
+                )
+
+            implied_positive = _implied_positive(table_standard_name)
+            if implied_positive:
+                _check_positive_attribute(
+                    ctx,
+                    coord_var,
+                    var_name,
+                    table_standard_name,
+                    implied_positive,
+                )
+
+            formula = ce.get("formula", "")
+            if formula:
+                expected_formula_terms = _parse_formula_terms(
+                    ce.get("z_factors", "")
+                )
+                file_formula_terms = _parse_formula_terms(
+                    _ncattr(coord_var, "formula_terms")
+                )
+                metadata_matches = (
+                    bool(expected_formula_terms)
+                    and file_formula_terms == expected_formula_terms
+                )
+                terms_available = metadata_matches and all(
+                    term_var in ds.variables
+                    for term_var in expected_formula_terms.values()
+                )
+                if terms_available:
+                    try:
+                        profile, sample = _formula_vertical_profile(
+                            ds,
+                            coord_var,
+                            ce,
+                            expected_formula_terms,
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        ctx.add_failure(
+                            f"Could not evaluate vertical formula for "
+                            f"'{var_name}': {exc}."
+                        )
+                    else:
+                        if stored_direction:
+                            _check_profile_direction(
+                                ctx,
+                                profile,
+                                stored_direction,
+                                f"Formula-derived profile for '{var_name}' at "
+                                f"{sample}",
+                            )
+            elif table_standard_name in _DIRECT_VERTICAL_STANDARD_NAMES:
+                _check_direct_vertical_values(
+                    ctx, coord_var[:], var_name, table_standard_name
+                )
 
             results.append(ctx.to_result())
 
@@ -784,6 +967,10 @@ class AICC(BaseNCCheck, BaseCheck):
 
             ctx = TestCtx(
                 BaseCheck.HIGH, f"[AICC004] Time coordinate ({time_dim_id})"
+            )
+            low_ctx = TestCtx(
+                BaseCheck.LOW,
+                f"[AICC004] Time coordinate ({time_dim_id}, advisory)",
             )
 
             data_out_name = (
@@ -826,22 +1013,13 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()
 
             # Attributes from CMIP7_coordinate.json
-            _check_coord_attrs(ctx, t_var, resolved_t, ce)
+            _check_coord_attrs(ctx, low_ctx, t_var, resolved_t, ce)
 
-            # units: must contain "since" and have a udunits-known base unit
+            # Units must match the CMOR template exactly (reference date is free).
             units = _ncattr(t_var, "units")
-            if not units or "since" not in units:
-                ctx.add_failure(
-                    f"'{resolved_t}' units={_format_attribute(units)} is missing "
-                    f"or invalid "
-                    f"(expected format 'X since Y-M-D ...')."
-                )
-            elif not cfutil.units_known(units.split(" since ")[0]):
-                ctx.add_failure(
-                    f"'{resolved_t}' time base unit "
-                    f"{_format_attribute(units.split(' since ')[0])} not "
-                    f"recognized by udunits."
-                )
+            level, msg = _compare_units(units, ce.get("units", ""))
+            if level != "ok":
+                ctx.add_failure(f"'{resolved_t}' units: {msg}")
             else:
                 ctx.add_pass()
 
@@ -901,6 +1079,8 @@ class AICC(BaseNCCheck, BaseCheck):
                             ctx.add_pass()
 
             results.append(ctx.to_result())
+            if low_ctx.messages:
+                results.append(low_ctx.to_result())
 
         return results
 
@@ -964,6 +1144,96 @@ class AICC(BaseNCCheck, BaseCheck):
 
             results.append(ctx.to_result())
             results.extend(low)
+
+        return results
+
+    # ------------------------------------------------------------------
+
+    def check_coordinate_direction(self, ds):
+        """Verify stored direction and physical direction where interpretable."""
+        axis_entries = self.CTcoords.get("axis_entry", {})
+        applicable = []
+        for dim_id in self.requested_dims:
+            if (
+                dim_id in HORIZONTAL_DIM_IDS
+                or dim_id in VERTICAL_GENERIC_IDS
+                or _is_time_dim(dim_id)
+            ):
+                continue
+            ce = axis_entries.get(dim_id)
+            if (
+                ce
+                and not _is_scalar_coord(ce)
+                and ce.get("type", "") != "character"
+                and (
+                    ce.get("stored_direction", "")
+                    or ce.get("standard_name", "")
+                    in _DIRECT_VERTICAL_STANDARD_NAMES
+                )
+            ):
+                applicable.append((dim_id, ce))
+
+        if not applicable:
+            ctx = TestCtx(BaseCheck.HIGH, "[AICC005b] Coordinate direction")
+            ctx.add_pass()
+            return [ctx.to_result()]
+
+        results = []
+        for dim_id, ce in applicable:
+            expected_name = ce.get("out_name", dim_id)
+            standard_name = ce.get("standard_name", "")
+            ctx = TestCtx(
+                BaseCheck.HIGH,
+                f"[AICC005b] Coordinate direction '{expected_name}'",
+            )
+
+            if expected_name in ds.variables:
+                var_name = expected_name
+            else:
+                matches = ds.get_variables_by_attributes(
+                    standard_name=standard_name
+                )
+                var_name = matches[0].name if matches else None
+
+            if var_name is None:
+                ctx.add_failure(
+                    f"Cannot check direction: coordinate '{expected_name}' "
+                    f"(standard_name='{standard_name}') was not found."
+                )
+                results.append(ctx.to_result())
+                continue
+
+            coord_var = ds.variables[var_name]
+            if coord_var.ndim != 1:
+                ctx.add_failure(
+                    f"Coordinate '{var_name}' must be one-dimensional for the "
+                    f"AICC005b direction check; found dimensions "
+                    f"{list(coord_var.dimensions)}."
+                )
+                results.append(ctx.to_result())
+                continue
+
+            stored_direction = ce.get("stored_direction", "")
+            if stored_direction:
+                _check_profile_direction(
+                    ctx,
+                    coord_var[:],
+                    stored_direction,
+                    f"Stored coordinate '{var_name}'",
+                )
+
+            if (
+                standard_name in _DIRECT_VERTICAL_STANDARD_NAMES
+                and not _ncattr(coord_var, "formula_terms")
+            ):
+                implied_positive = _implied_positive(standard_name)
+                _check_positive_attribute(
+                    ctx, coord_var, var_name, standard_name, implied_positive
+                )
+                _check_direct_vertical_values(
+                    ctx, coord_var[:], var_name, standard_name
+                )
+            results.append(ctx.to_result())
 
         return results
 
@@ -1388,6 +1658,320 @@ class AICC(BaseNCCheck, BaseCheck):
 
 
 
+_DIRECT_VERTICAL_STANDARD_NAMES = frozenset({"air_pressure", "height", "depth"})
+
+
+def _implied_positive(standard_name: str):
+    """Return the physical positive direction implied by a standard_name."""
+    if standard_name in {"air_pressure", "depth"}:
+        return "down"
+    if standard_name == "height":
+        return "up"
+    if standard_name.startswith("atmosphere_"):
+        if "pressure_coordinate" in standard_name:
+            return "down"
+        if "height_coordinate" in standard_name or "sleve_coordinate" in standard_name:
+            return "up"
+    if standard_name.startswith("ocean_") and standard_name.endswith("_coordinate"):
+        # CF ocean parametric formulas calculate z as height, positive upwards.
+        return "up"
+    return None
+
+
+def _numeric_profile(values, label: str):
+    """Return a finite, unmasked one-dimensional numeric profile."""
+    masked = np.ma.asarray(values, dtype="float64").reshape(-1)
+    if np.any(np.ma.getmaskarray(masked)):
+        raise ValueError(f"{label} contains masked values")
+    profile = np.asarray(masked, dtype="float64")
+    if not np.all(np.isfinite(profile)):
+        raise ValueError(f"{label} contains non-finite values")
+    return profile
+
+
+def _check_profile_direction(
+    ctx: TestCtx,
+    values,
+    direction: str,
+    label: str,
+    source_ndim=None,
+):
+    """Add a strict monotonicity result for a stored or calculated profile."""
+    if source_ndim is not None and source_ndim != 1:
+        ctx.add_failure(
+            f"{label} must be one-dimensional to check stored_direction; "
+            f"found {source_ndim} dimensions."
+        )
+        return
+
+    try:
+        profile = _numeric_profile(values, label)
+    except (TypeError, ValueError) as exc:
+        ctx.add_failure(f"Could not check {direction} direction: {exc}.")
+        return
+
+    if profile.size < 2:
+        ctx.add_failure(
+            f"{label} has fewer than two values, so its {direction} direction "
+            f"cannot be verified."
+        )
+        return
+
+    differences = np.diff(profile)
+    if direction == "increasing":
+        valid = bool(np.all(differences > 0))
+    elif direction == "decreasing":
+        valid = bool(np.all(differences < 0))
+    else:
+        ctx.add_failure(f"Unsupported stored_direction '{direction}' for {label}.")
+        return
+
+    if valid:
+        ctx.add_pass()
+    else:
+        bad = np.flatnonzero(
+            differences <= 0 if direction == "increasing" else differences >= 0
+        )
+        ctx.add_failure(
+            f"{label} is not strictly {direction} as required by "
+            f"stored_direction; first mismatch is between positions "
+            f"{int(bad[0])} and {int(bad[0]) + 1}."
+        )
+
+
+def _check_positive_attribute(
+    ctx: TestCtx,
+    coord_var,
+    var_name: str,
+    standard_name: str,
+    implied_positive,
+):
+    """Check positive against the physical direction implied by standard_name."""
+    if implied_positive is None:
+        return
+    actual = str(_ncattr(coord_var, "positive")).lower()
+    if actual != implied_positive:
+        displayed = _format_attribute(_ncattr(coord_var, "positive"))
+        ctx.add_failure(
+            f"'{var_name}' positive={displayed} "
+            f"is inconsistent with standard_name='{standard_name}', which implies "
+            f"positive='{implied_positive}'."
+        )
+    else:
+        ctx.add_pass()
+
+
+def _check_direct_vertical_values(
+    ctx: TestCtx,
+    values,
+    var_name: str,
+    standard_name: str,
+):
+    """Check the sign domain of direct pressure, height, and depth values."""
+    try:
+        profile = _numeric_profile(values, f"Coordinate '{var_name}'")
+    except (TypeError, ValueError) as exc:
+        ctx.add_failure(f"Could not check physical values: {exc}.")
+        return
+
+    if standard_name == "air_pressure":
+        valid = bool(np.all(profile > 0))
+        expected = "strictly positive"
+    else:
+        valid = bool(np.all(profile >= 0))
+        expected = "non-negative"
+
+    if valid:
+        ctx.add_pass()
+    else:
+        ctx.add_failure(
+            f"Coordinate '{var_name}' with standard_name='{standard_name}' must "
+            f"contain {expected} values; found minimum {profile.min()}."
+        )
+
+
+def _sample_formula_term(var, vertical_dim: str, point: dict):
+    """Read one point from nonvertical dimensions and retain the vertical axis."""
+    key = tuple(
+        slice(None) if dim == vertical_dim else point.get(dim, 0)
+        for dim in var.dimensions
+    )
+    values = np.ma.asarray(var[key], dtype="float64")
+    if np.any(np.ma.getmaskarray(values)):
+        raise ValueError(f"formula term '{var.name}' is masked at the sampled point")
+    values = np.asarray(values, dtype="float64").squeeze()
+    if not np.all(np.isfinite(values)):
+        raise ValueError(
+            f"formula term '{var.name}' is non-finite at the sampled point"
+        )
+    if vertical_dim in var.dimensions:
+        return np.asarray(values).reshape(-1)
+    if np.asarray(values).size != 1:
+        raise ValueError(
+            f"formula term '{var.name}' did not reduce to a scalar at the "
+            f"sampled point"
+        )
+    return float(np.asarray(values).reshape(-1)[0])
+
+
+def _eval_formula_node(node, terms):
+    """Evaluate the arithmetic subset used by CMOR vertical formulas."""
+    if isinstance(node, ast.Expression):
+        return _eval_formula_node(node.body, terms)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id not in terms:
+            raise KeyError(f"formula term '{node.id}' is not declared")
+        return terms[node.id]
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        value = _eval_formula_node(node.operand, terms)
+        return value if isinstance(node.op, ast.UAdd) else -value
+    if isinstance(node, ast.BinOp):
+        left = _eval_formula_node(node.left, terms)
+        right = _eval_formula_node(node.right, terms)
+        operations = {
+            ast.Add: lambda: left + right,
+            ast.Sub: lambda: left - right,
+            ast.Mult: lambda: left * right,
+            ast.Div: lambda: left / right,
+            ast.Pow: lambda: left ** right,
+        }
+        operation = operations.get(type(node.op))
+        if operation is None:
+            raise ValueError("formula contains an unsupported operator")
+        return operation()
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        arguments = [_eval_formula_node(arg, terms) for arg in node.args]
+        functions = {
+            "min": np.minimum,
+            "max": np.maximum,
+            "exp": np.exp,
+            "log": np.log,
+            "sinh": np.sinh,
+            "cosh": np.cosh,
+            "tanh": np.tanh,
+        }
+        function = functions.get(node.func.id)
+        if function is None or not arguments:
+            raise ValueError(f"unsupported formula function '{node.func.id}'")
+        if node.func.id in {"min", "max"}:
+            result = arguments[0]
+            for argument in arguments[1:]:
+                result = function(result, argument)
+            return result
+        if len(arguments) != 1:
+            raise ValueError(f"formula function '{node.func.id}' expects one argument")
+        return function(arguments[0])
+    raise ValueError("formula contains unsupported syntax")
+
+
+def _evaluate_vertical_formula(formula: str, standard_name: str, terms, nlevels: int):
+    """Evaluate a CMOR vertical formula for one sampled nonvertical point."""
+    if standard_name == "ocean_sigma_z_coordinate":
+        required = {"eta", "sigma", "depth", "depth_c", "nsigma", "zlev"}
+        missing = sorted(required - terms.keys())
+        if missing:
+            raise KeyError(f"formula term(s) {missing} are not declared")
+        count = int(np.asarray(terms["nsigma"]).reshape(-1)[0])
+        count = max(0, min(count, nlevels))
+        sigma = np.broadcast_to(terms["sigma"], (nlevels,))
+        zlev = np.broadcast_to(terms["zlev"], (nlevels,))
+        profile = np.array(zlev, dtype="float64", copy=True)
+        profile[:count] = terms["eta"] + sigma[:count] * (
+            min(terms["depth_c"], terms["depth"]) + terms["eta"]
+        )
+        return profile
+
+    if "=" not in formula:
+        raise ValueError("formula has no '=' expression")
+    expression = formula.split("=", 1)[1].strip().replace("^", "**")
+    for term in sorted(terms, key=len, reverse=True):
+        expression = re.sub(
+            rf"\b{re.escape(term)}\s*\([^()]*\)", term, expression
+        )
+    parsed = ast.parse(expression, mode="eval")
+    result = _eval_formula_node(parsed, terms)
+    try:
+        return np.asarray(np.broadcast_to(result, (nlevels,)), dtype="float64")
+    except ValueError as exc:
+        raise ValueError(
+            f"formula result has shape {np.shape(result)}, expected {nlevels} levels"
+        ) from exc
+
+
+def _formula_vertical_profile(
+    ds,
+    coord_var,
+    ce: dict,
+    formula_terms: dict,
+):
+    """Calculate one usable formula-derived profile across all vertical levels."""
+    if coord_var.ndim != 1:
+        raise ValueError(
+            f"coordinate '{coord_var.name}' must be one-dimensional; found "
+            f"dimensions {list(coord_var.dimensions)}"
+        )
+    vertical_dim = coord_var.dimensions[0]
+    if not formula_terms:
+        raise ValueError("CMOR formula_terms mapping is missing or empty")
+
+    variables = {}
+    for term, var_name in formula_terms.items():
+        if var_name not in ds.variables:
+            raise KeyError(f"formula term '{term}' references missing '{var_name}'")
+        variables[term] = ds.variables[var_name]
+
+    sample_dims = []
+    for var in variables.values():
+        for dim in var.dimensions:
+            if dim != vertical_dim and dim not in sample_dims:
+                sample_dims.append(dim)
+    sample_shape = tuple(len(ds.dimensions[dim]) for dim in sample_dims)
+    sample_count = int(np.prod(sample_shape)) if sample_shape else 1
+
+    last_error = None
+    for flat_index in range(min(sample_count, 10000)):
+        indices = np.unravel_index(flat_index, sample_shape) if sample_shape else ()
+        point = dict(zip(sample_dims, indices))
+        try:
+            terms = {
+                term: _sample_formula_term(var, vertical_dim, point)
+                for term, var in variables.items()
+            }
+        except (TypeError, ValueError) as exc:
+            last_error = exc
+            continue
+
+        try:
+            profile = _evaluate_vertical_formula(
+                ce.get("formula", ""),
+                ce.get("standard_name", ""),
+                terms,
+                len(coord_var),
+            )
+        except (KeyError, TypeError, ValueError, SyntaxError):
+            # Formula syntax and term declarations are independent of the point.
+            raise
+
+        try:
+            profile = _numeric_profile(profile, "Formula-derived profile")
+        except (TypeError, ValueError) as exc:
+            last_error = exc
+            continue
+
+        sample = (
+            "sampled point "
+            + ", ".join(f"{dim}={point[dim]}" for dim in sample_dims)
+            if sample_dims
+            else "vertical-only formula terms"
+        )
+        return profile, sample
+
+    detail = f": {last_error}" if last_error else ""
+    raise ValueError(f"no usable sampled point was found{detail}")
+
+
 def _vertical_config_ctx(ds, name: str) -> TestCtx:
     """Return the common prerequisite failure for model-specific Z checks."""
     ctx = TestCtx(BaseCheck.HIGH, name)
@@ -1401,21 +1985,33 @@ def _vertical_config_ctx(ds, name: str) -> TestCtx:
     return ctx
 
 
-def _check_formula_var_attrs(ctx: TestCtx, var, var_name: str, ft_entry: dict):
+def _check_formula_var_attrs(
+    ctx: TestCtx,
+    low_ctx: TestCtx,
+    var,
+    var_name: str,
+    ft_entry: dict,
+):
     """Check a formula-term variable's table-defined attributes."""
     expected_units = ft_entry.get("units", "")
     if expected_units:
         level, msg = _compare_units(_ncattr(var, "units"), expected_units)
-        if level == "fail":
+        if level != "ok":
             ctx.add_failure(f"Formula term '{var_name}' units: {msg}")
         else:
             ctx.add_pass()
 
-    _check_coord_attrs(ctx, var, var_name, ft_entry)
+    _check_coord_attrs(ctx, low_ctx, var, var_name, ft_entry)
 
 
-def _check_coord_attrs(ctx: TestCtx, var, var_name: str, ce: dict):
-    """Check standard_name and long_name of a coordinate variable against the table."""
+def _check_coord_attrs(
+    ctx: TestCtx,
+    low_ctx: TestCtx,
+    var,
+    var_name: str,
+    ce: dict,
+):
+    """Check required standard_name and advisory long_name attributes."""
     expected_sn = ce.get("standard_name", "")
     if expected_sn:
         actual_sn = _ncattr(var, "standard_name")
@@ -1431,12 +2027,10 @@ def _check_coord_attrs(ctx: TestCtx, var, var_name: str, ce: dict):
     if expected_ln:
         actual_ln = _ncattr(var, "long_name")
         if actual_ln != expected_ln:
-            ctx.add_failure(
+            low_ctx.add_failure(
                 f"'{var_name}' long_name={_format_attribute(actual_ln)}; "
                 f"expected '{expected_ln}'."
             )
-        else:
-            ctx.add_pass()
 
 
 
@@ -1452,7 +2046,6 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                          bounds_values: str = "") -> list:
     """Check a scalar coordinate. Returns list[Result] for LOW advisories."""
     low_ctx = TestCtx(BaseCheck.LOW, f"[AICC005] Coordinate '{out_name}' (advisory)")
-    low_findings: list = []
 
     # Locate by exact out_name, fall back to standard_name search
     coord_var_name = out_name if out_name in ds.variables else None
@@ -1467,11 +2060,11 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
         ctx.add_failure(
             f"Scalar coordinate '{out_name}' (dim_id='{dim_id}') not found in file."
         )
-        return low_findings
+        return []
     ctx.add_pass()
 
     coord_var = ds.variables[coord_var_name]
-    _check_coord_attrs(ctx, coord_var, coord_var_name, ce)
+    _check_coord_attrs(ctx, low_ctx, coord_var, coord_var_name, ce)
 
     if is_character:
         dims = list(coord_var.dimensions)
@@ -1518,7 +2111,6 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                                     f"expected {expected_val} but is within valid range "
                                     f"[{vmin}, {vmax}]."
                                 )
-                                low_findings = [low_ctx.to_result()]
                             else:
                                 ctx.add_failure(
                                     f"'{coord_var_name}' value={actual}; expected "
@@ -1599,7 +2191,6 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                                     f"'{bnds_name}' bounds=[{act_lo}, {act_hi}] within "
                                     f"tolerance but not exact; expected [{exp_lo}, {exp_hi}]."
                                 )
-                                low_findings = [low_ctx.to_result()]
                     else:
                         default_tol = 1e-6 * max(1.0, abs(exp_lo), abs(exp_hi))
                         if not (np.isclose(act_lo, exp_lo, atol=default_tol)
@@ -1613,7 +2204,7 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                 except Exception as exc:
                     ctx.add_failure(f"Could not check bounds_values of '{bnds_name}': {exc}")
 
-    return low_findings
+    return [low_ctx.to_result()] if low_ctx.messages else []
 
 
 def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
@@ -1622,7 +2213,6 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                               expected_units: str, bnds_map: dict) -> list:
     """Check a multi-value coordinate. Returns list[Result] for LOW advisories."""
     low_ctx = TestCtx(BaseCheck.LOW, f"[AICC005] Coordinate '{out_name}' (advisory)")
-    low_findings: list = []
 
     expected_var_name = "sector" if is_character else out_name
     coord_var_name = expected_var_name if expected_var_name in ds.variables else None
@@ -1637,7 +2227,7 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
             ctx.add_failure(
                 f"Coordinate variable '{expected_var_name}' not found in file."
             )
-            return low_findings
+            return []
         coord_var_name = matches[0].name
         ctx.add_failure(
             f"Coordinate variable '{coord_var_name}' was identified by "
@@ -1650,7 +2240,7 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
     coord_var = ds.variables[coord_var_name]
 
     # Verify standard_name and long_name against the table
-    _check_coord_attrs(ctx, coord_var, coord_var_name, ce)
+    _check_coord_attrs(ctx, low_ctx, coord_var, coord_var_name, ce)
 
     if is_character:
         # Dims must be (out_name, strlen)
@@ -1686,7 +2276,7 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
         # units via udunits
         if expected_units:
             level, msg = _compare_units(_ncattr(coord_var, "units"), expected_units)
-            if level == "fail":
+            if level != "ok":
                 ctx.add_failure(f"'{coord_var_name}' units: {msg}")
             else:
                 ctx.add_pass()
@@ -1727,7 +2317,6 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                         f"'{coord_var_name}' value(s) {within_tol_not_exact} match "
                         f"within tolerance (factor={tol_factor}) but not exactly."
                     )
-                    low_findings = [low_ctx.to_result()]
             except Exception as exc:
                 ctx.add_failure(f"Could not check values of '{coord_var_name}': {exc}")
 
@@ -1787,10 +2376,9 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                                 f"'{bnds_name}' bound pair(s) {within_tol_bnds} match "
                                 f"within tolerance (factor={tol_factor}) but not exactly."
                             )
-                            low_findings = [low_ctx.to_result()]
                     except Exception as exc:
                         ctx.add_failure(
                             f"Could not check bounds of '{coord_var_name}': {exc}"
                         )
 
-    return low_findings
+    return [low_ctx.to_result()] if low_ctx.messages else []
