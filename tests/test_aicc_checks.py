@@ -9,7 +9,7 @@ from compliance_checker.base import BaseCheck
 from netCDF4 import Dataset
 
 from cc_plugin_aicc.aicc import AICC
-from cc_plugin_aicc.utils import _compare_units
+from cc_plugin_aicc.utils import _compare_units, _neutral_dtype
 
 
 TIME_ENTRY = {
@@ -17,6 +17,7 @@ TIME_ENTRY = {
     "standard_name": "time",
     "long_name": "Time Intervals",
     "units": "days since ?",
+    "type": "double",
     "must_have_bounds": "no",
 }
 
@@ -27,6 +28,7 @@ HYBRID_ENTRY = {
     "positive": "down",
     "formula": "p = ap + b*ps",
     "z_factors": "ap: ap b: b ps: ps",
+    "type": "double",
 }
 
 DEPTH_ENTRY = {
@@ -51,18 +53,31 @@ RHO_ENTRY = {
     "bounds_values": "",
 }
 
+PLEV_ENTRY = {
+    "out_name": "plev",
+    "standard_name": "air_pressure",
+    "stored_direction": "decreasing",
+    "positive": "down",
+    "formula": "",
+    "type": "double",
+    "value": "",
+    "bounds_values": "",
+}
+
 UNSTRUCTURED_GRID_ENTRIES = {
     "latitude": {
         "out_name": "latitude",
         "standard_name": "latitude",
         "long_name": "latitude",
         "units": "degrees_north",
+        "type": "double",
     },
     "vertices_latitude": {
         "out_name": "vertices_latitude",
         "standard_name": "",
         "long_name": "",
         "units": "degrees_north",
+        "type": "double",
     },
 }
 
@@ -117,6 +132,19 @@ def test_compare_units_requires_an_exact_match(
 
     assert level == expected_level
     assert message_fragment in message
+
+
+@pytest.mark.parametrize(
+    ("dtype", "cmor_type"),
+    [
+        ("float64", "double"),
+        ("float32", "real"),
+        ("int32", "integer"),
+        ("S1", "character"),
+    ],
+)
+def test_neutral_dtype_distinguishes_cmor_storage_types(dtype, cmor_type):
+    assert _neutral_dtype(np.asarray([], dtype=dtype)) == cmor_type
 
 
 def test_time_long_name_is_suggested_but_convertible_units_are_required(tmp_path):
@@ -305,6 +333,48 @@ def test_coordinate_direction_reports_nonmonotonic_depth(tmp_path):
     assert any(
         "not strictly increasing" in message
         for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_coordinate_reports_an_incorrect_storage_type(tmp_path):
+    dataset = xr.Dataset(
+        coords={"depth": ("depth", np.asarray([0.0, 10.0], dtype="float32"))}
+    )
+    dataset["depth"].attrs["standard_name"] = "depth"
+    checker = _checker(["sdepth"], {"sdepth": DEPTH_ENTRY})
+
+    with _open_netcdf(tmp_path, "depth_float32", dataset) as nc:
+        results = checker.check_coord(nc)
+
+    assert any(
+        "'depth' has data type 'float32' (CMOR type 'real'); expected CMOR type "
+        "'double'" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_coordinate_positive_is_checked_against_table_and_physical_meaning(
+    tmp_path,
+):
+    dataset = xr.Dataset(
+        coords={"plev": ("plev", [100000.0, 50000.0, 10000.0])}
+    )
+    dataset["plev"].attrs.update(
+        {"standard_name": "air_pressure", "positive": "up"}
+    )
+    checker = _checker(["plev19"], {"plev19": PLEV_ENTRY})
+
+    with _open_netcdf(tmp_path, "plev_positive_up", dataset) as nc:
+        table_results = checker.check_coord(nc)
+        direction_results = checker.check_coordinate_direction(nc)
+
+    assert any(
+        "'plev' positive='up'; expected 'down' from the CMOR table" in message
+        for message in _messages(table_results, BaseCheck.HIGH)
+    )
+    assert any(
+        "positive='up'" in message and "implies positive='down'" in message
+        for message in _messages(direction_results, BaseCheck.HIGH)
     )
 
 

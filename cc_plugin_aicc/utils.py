@@ -37,13 +37,19 @@ def _ncattr(var_or_ds, name: str, default=""):
 # Adapted from swarnaleem's neutral_dtype() — github.com/swarnaleem/cc-plugin-wcrp
 # feature/coordinate-standard db0791d plugins/coordinate_standard/classify.py
 def _neutral_dtype(var) -> str:
-    """Return 'character', 'integer', or 'double' for a netCDF4 variable."""
-    kind = getattr(getattr(var, "dtype", None), "kind", "")
-    if kind in ("S", "U"):
+    """Return the CMOR type represented by a netCDF4 variable's dtype."""
+    dtype = getattr(var, "dtype", None)
+    kind = getattr(dtype, "kind", "")
+    if kind in ("S", "U") or dtype is str:
         return "character"
     if kind in ("i", "u"):
         return "integer"
-    return "double"
+    if kind == "f":
+        if getattr(dtype, "itemsize", 0) == 4:
+            return "real"
+        if getattr(dtype, "itemsize", 0) == 8:
+            return "double"
+    return ""
 
 
 # Adapted from swarnaleem's _compare_units() — github.com/swarnaleem/cc-plugin-wcrp

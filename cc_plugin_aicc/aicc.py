@@ -316,6 +316,7 @@ class AICC(BaseNCCheck, BaseCheck):
 
             # Attributes from CMIP7_grids.json
             _check_coord_attrs(ctx, low_ctx, aux_var, aux_var_name, grid_entry)
+            _check_coord_type(ctx, aux_var, aux_var_name, grid_entry)
 
             # Must be 1-D (single unstructured cell dimension)
             if aux_var.ndim != 1:
@@ -380,6 +381,7 @@ class AICC(BaseNCCheck, BaseCheck):
                 vtx_entry,
                 missing_ok=True,
             )
+            _check_coord_type(vtx_ctx, vtx_var, vtx_var_name, vtx_entry)
 
             if vtx_var.ndim != 2:
                 vtx_ctx.add_failure(
@@ -535,6 +537,7 @@ class AICC(BaseNCCheck, BaseCheck):
 
             # Attributes from CMIP7_coordinate.json
             _check_coord_attrs(ctx, low_ctx, var, var_name, ce)
+            _check_coord_type(ctx, var, var_name, ce)
 
             level, msg = _compare_units(_ncattr(var, "units"), expected_units)
             if level != "ok":
@@ -681,6 +684,7 @@ class AICC(BaseNCCheck, BaseCheck):
 
             # Attributes from CMIP7_coordinate.json
             _check_coord_attrs(ctx, low_ctx, lev_var, lev_var_name, ce)
+            _check_coord_type(ctx, lev_var, lev_var_name, ce)
 
             # units (via udunits-backed comparison)
             if expected_units:
@@ -1026,6 +1030,7 @@ class AICC(BaseNCCheck, BaseCheck):
 
             # Attributes from CMIP7_coordinate.json
             _check_coord_attrs(ctx, low_ctx, t_var, resolved_t, ce)
+            _check_coord_type(ctx, t_var, resolved_t, ce)
 
             # Units must match the CMOR template exactly (reference date is free).
             units = _ncattr(t_var, "units")
@@ -2018,6 +2023,8 @@ def _check_formula_var_attrs(
     ft_entry: dict,
 ):
     """Check a formula-term variable's table-defined attributes."""
+    _check_coord_type(ctx, var, var_name, ft_entry)
+
     expected_units = ft_entry.get("units", "")
     if expected_units:
         level, msg = _compare_units(_ncattr(var, "units"), expected_units)
@@ -2066,6 +2073,47 @@ def _check_coord_attrs(
             )
 
 
+def _check_coord_type(
+    ctx: TestCtx,
+    var,
+    var_name: str,
+    ce: dict,
+):
+    """Check a coordinate variable's storage type against its CMOR entry."""
+    expected_type = ce.get("type", "")
+    if not expected_type:
+        return
+
+    actual_type = _neutral_dtype(var)
+    if actual_type != expected_type:
+        ctx.add_failure(
+            f"'{var_name}' has data type '{var.dtype}'"
+            + (f" (CMOR type '{actual_type}')" if actual_type else "")
+            + f"; expected CMOR type '{expected_type}'."
+        )
+    else:
+        ctx.add_pass()
+
+
+def _check_coord_table_positive(
+    ctx: TestCtx,
+    var,
+    var_name: str,
+    ce: dict,
+):
+    """Check positive against the value declared by the CMOR table."""
+    expected_positive = ce.get("positive", "")
+    if not expected_positive:
+        return
+
+    actual_positive = _ncattr(var, "positive")
+    if actual_positive != expected_positive:
+        ctx.add_failure(
+            f"'{var_name}' positive={_format_attribute(actual_positive)}; "
+            f"expected '{expected_positive}' from the CMOR table."
+        )
+    else:
+        ctx.add_pass()
 
 
 # kept for scalar-only callers
@@ -2098,6 +2146,8 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
 
     coord_var = ds.variables[coord_var_name]
     _check_coord_attrs(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_type(ctx, coord_var, coord_var_name, ce)
+    _check_coord_table_positive(ctx, coord_var, coord_var_name, ce)
 
     if is_character:
         dims = list(coord_var.dimensions)
@@ -2274,6 +2324,8 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
 
     # Verify standard_name and long_name against the table
     _check_coord_attrs(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_type(ctx, coord_var, coord_var_name, ce)
+    _check_coord_table_positive(ctx, coord_var, coord_var_name, ce)
 
     if is_character:
         # Dims must be (out_name, strlen)
