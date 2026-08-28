@@ -148,15 +148,28 @@ def _find_formula_entry(formula_entries: dict, var_name: str, generic_id: str) -
 
 
 def _cmor_tol_val(i: int, req_vals: list, bound_pairs: list, tolerance: float) -> float:
-    """Compute the per-element CMOR tolerance as defined in the CMIP7 coordinate CV.
+    """Compute the CMOR tolerance for one requested coordinate value.
 
-    tolerance is the raw float from the table entry (already validated > 0).
-    bound_pairs is a list of (lo, hi) tuples aligned with req_vals, or empty.
+    ``bound_pairs`` is retained for compatibility with existing callers, but
+    coordinate-value tolerances do not depend on requested bounds.  The first
+    value uses the following spacing and subsequent values use the preceding
+    spacing, exactly as specified by the CMIP7 coordinate QC recipe.
     """
     tol = 0.001 * tolerance * abs(req_vals[i])
-    if i > 0:
-        tol = min(tol, 0.001 * tolerance * abs(req_vals[i] - req_vals[i - 1]))
-    if bound_pairs and i < len(bound_pairs):
-        lo, hi = bound_pairs[i]
-        tol = min(tol, 0.001 * tolerance * abs(hi - lo))
+    if i == 0 and len(req_vals) > 1:
+        tol = min(tol, tolerance * abs(req_vals[1] - req_vals[0]))
+    elif i > 0:
+        tol = min(tol, tolerance * abs(req_vals[i] - req_vals[i - 1]))
     return tol
+
+
+def _cmor_bound_tol_vals(
+    i: int, bound_pairs: list, tolerance: float
+) -> tuple[float, float]:
+    """Return the CMOR tolerances for a requested lower/upper bound pair."""
+    lo, hi = bound_pairs[i]
+    cell_tol = tolerance * abs(hi - lo)
+    return (
+        min(cell_tol, 0.001 * tolerance * abs(lo)),
+        min(cell_tol, 0.001 * tolerance * abs(hi)),
+    )

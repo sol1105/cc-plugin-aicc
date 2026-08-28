@@ -25,12 +25,13 @@ from cc_plugin_aicc.config import (
     REALM_TO_TABLE,
     VERTICAL_GENERIC_IDS,
     load_grid_config,
-    load_model_config,
+    load_vertical_config,
     resolve_grid_type,
-    resolve_model_config,
+    resolve_vertical_config,
 )
 from cc_plugin_aicc.utils import (
     _as_list,
+    _cmor_bound_tol_vals,
     _cmor_tol_val,
     _compare_units,
     _decode_char_scalar,
@@ -74,6 +75,11 @@ class AICC(BaseNCCheck, BaseCheck):
             "dimensions": "_expected_rectilinear_horizontal_dimensions",
             "table": "coordinate",
         },
+        "curvilinear": {
+            "check": "_check_curvilinear_grid",
+            "dimensions": "_expected_curvilinear_horizontal_dimensions",
+            "table": "grids",
+        },
     }
 
     def __init__(self, options=None):
@@ -96,16 +102,17 @@ class AICC(BaseNCCheck, BaseCheck):
 
         # Resolve the model-specific vertical mapping.
         source_id = _ncattr(dataset, "source_id")
-        mc_opt = self.options.get("model_config", self.options.get("vertical_config"))
-        model_config = load_model_config(mc_opt)
+        vertical_config = load_vertical_config(self.options.get("vertical_config"))
 
-        self._conf_key, model_conf = resolve_model_config(source_id, model_config)
-        if model_conf:
+        self._conf_key, vertical_conf = resolve_vertical_config(
+            source_id, vertical_config
+        )
+        if vertical_conf:
             # Support both nested and legacy flat vertical configurations.
-            if "vertical" in model_conf:
-                self._vert_mapping = model_conf.get("vertical") or {}
+            if "vertical" in vertical_conf:
+                self._vert_mapping = vertical_conf.get("vertical") or {}
             else:
-                self._vert_mapping = model_conf
+                self._vert_mapping = vertical_conf
         else:
             self._vert_mapping = None
 
@@ -290,6 +297,10 @@ class AICC(BaseNCCheck, BaseCheck):
                 BaseCheck.LOW,
                 f"[AICC002] {dim_id} auxiliary coordinate (advisory)",
             )
+            medium_ctx = TestCtx(
+                BaseCheck.MEDIUM,
+                f"[AICC002] {dim_id} auxiliary coordinate (recommended)",
+            )
             grid_entry = grid_entries.get(dim_id, {})
             expected_units = grid_entry.get("units", "")
             vtx_key = f"vertices_{dim_id}"
@@ -315,8 +326,12 @@ class AICC(BaseNCCheck, BaseCheck):
             aux_var = ds.variables[aux_var_name]
 
             # Attributes from CMIP7_grids.json
-            _check_coord_attrs(ctx, low_ctx, aux_var, aux_var_name, grid_entry)
+            _check_coord_attrs(
+                ctx, low_ctx, aux_var, aux_var_name, grid_entry,
+                medium_ctx=medium_ctx,
+            )
             _check_coord_type(ctx, aux_var, aux_var_name, grid_entry)
+            _check_valid_range(ctx, aux_var, aux_var_name, grid_entry)
 
             # Must be 1-D (single unstructured cell dimension)
             if aux_var.ndim != 1:
@@ -346,6 +361,8 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()  # pass even for convertible (advisory only)
 
             results.append(ctx.to_result())
+            if medium_ctx.messages:
+                results.append(medium_ctx.to_result())
             if low_ctx.messages:
                 results.append(low_ctx.to_result())
 
@@ -465,6 +482,278 @@ class AICC(BaseNCCheck, BaseCheck):
 
         return results
 
+    def _check_curvilinear_grid(self, ds, lat_vars, lon_vars, grid_entries):
+        """Validate 2-D auxiliary lon/lat, vertices, and optional grid axes."""
+        results = []
+        coordinate_dims = {}
+
+        for dim_id, cf_vars in (("latitude", lat_vars), ("longitude", lon_vars)):
+            if dim_id not in self.requested_dims:
+                continue
+            entry = grid_entries.get(dim_id, {})
+            out_name = entry.get("out_name", dim_id)
+            ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] curvilinear {dim_id}")
+            medium_ctx = TestCtx(
+                BaseCheck.MEDIUM,
+                f"[AICC002] curvilinear {dim_id} (recommended)",
+            )
+            low_ctx = TestCtx(
+                BaseCheck.LOW, f"[AICC002] curvilinear {dim_id} (advisory)"
+            )
+
+            name = out_name if out_name in ds.variables else next(iter(cf_vars), None)
+            if name is None:
+                ctx.add_failure(
+                    f"Curvilinear {dim_id} variable '{out_name}' not found."
+                )
+                results.append(ctx.to_result())
+                continue
+            if name != out_name:
+                ctx.add_failure(
+                    f"Curvilinear {dim_id} variable '{name}' was identified by CF "
+                    f"metadata, but CMIP7_grids.json requires '{out_name}'."
+                )
+            else:
+                ctx.add_pass()
+
+            var = ds.variables[name]
+            if var.ndim != 2:
+                ctx.add_failure(
+                    f"Curvilinear {dim_id} coordinate '{name}' must be 2-D; found "
+                    f"dimensions {list(var.dimensions)}."
+                )
+            else:
+                ctx.add_pass()
+                coordinate_dims[dim_id] = var.dimensions
+
+            _check_coord_attrs(
+                ctx, low_ctx, var, name, entry, medium_ctx=medium_ctx
+            )
+            _check_coord_type(ctx, var, name, entry)
+            _check_coord_units(ctx, low_ctx, var, name, entry)
+            _check_valid_range(ctx, var, name, entry)
+
+            vertex_key = f"vertices_{dim_id}"
+            vertex_entry = grid_entries.get(vertex_key, {})
+            vertex_name = vertex_entry.get("out_name", vertex_key)
+            if vertex_name not in ds.variables:
+                ctx.add_failure(
+                    f"Curvilinear vertex variable '{vertex_name}' not found for "
+                    f"'{name}'."
+                )
+            else:
+                ctx.add_pass()
+                vertex = ds.variables[vertex_name]
+                _check_coord_attrs(
+                    ctx,
+                    low_ctx,
+                    vertex,
+                    vertex_name,
+                    vertex_entry,
+                    missing_ok=True,
+                    medium_ctx=medium_ctx,
+                )
+                _check_coord_type(ctx, vertex, vertex_name, vertex_entry)
+                _check_coord_units(ctx, low_ctx, vertex, vertex_name, vertex_entry)
+                _check_valid_range(ctx, vertex, vertex_name, vertex_entry)
+                valid_vertex_dims = (
+                    var.ndim == 2
+                    and vertex.ndim == 3
+                    and vertex.dimensions[:2] == var.dimensions
+                    and vertex.shape[:2] == var.shape
+                    and vertex.shape[2] >= 3
+                )
+                if not valid_vertex_dims:
+                    ctx.add_failure(
+                        f"Curvilinear vertex variable '{vertex_name}' must use the "
+                        f"coordinate's two dimensions followed by a vertex dimension "
+                        f"of size at least 3; found dimensions "
+                        f"{list(vertex.dimensions)} and shape {vertex.shape}."
+                    )
+                else:
+                    ctx.add_pass()
+
+            results.append(ctx.to_result())
+            if medium_ctx.messages:
+                results.append(medium_ctx.to_result())
+            if low_ctx.messages:
+                results.append(low_ctx.to_result())
+
+        if len(coordinate_dims) == 2:
+            shared_ctx = TestCtx(
+                BaseCheck.HIGH, "[AICC002] curvilinear horizontal dimensions"
+            )
+            if coordinate_dims["latitude"] != coordinate_dims["longitude"]:
+                shared_ctx.add_failure(
+                    "Curvilinear latitude and longitude must share the same two "
+                    f"dimensions; found latitude{coordinate_dims['latitude']} and "
+                    f"longitude{coordinate_dims['longitude']}."
+                )
+            else:
+                shared_ctx.add_pass()
+                results.extend(
+                    self._check_curvilinear_axes(ds, coordinate_dims["latitude"])
+                )
+            results.append(shared_ctx.to_result())
+
+        data_out_name = self.var_entry.get("out_name", "") if self.var_entry else ""
+        if data_out_name and data_out_name in ds.variables:
+            ctx = TestCtx(
+                BaseCheck.HIGH,
+                f"[AICC002] '{data_out_name}' curvilinear coordinates attribute",
+            )
+            listed = _ncattr(ds.variables[data_out_name], "coordinates")
+            listed = listed.split() if listed else []
+            for dim_id in ("latitude", "longitude"):
+                if dim_id not in self.requested_dims:
+                    continue
+                expected = grid_entries.get(dim_id, {}).get("out_name", dim_id)
+                if expected not in listed:
+                    ctx.add_failure(
+                        f"'{data_out_name}' coordinates attribute must include "
+                        f"curvilinear coordinate '{expected}'."
+                    )
+                else:
+                    ctx.add_pass()
+            results.append(ctx.to_result())
+
+        return results
+
+    def _check_curvilinear_axes(self, ds, horizontal_dims):
+        """Validate one supported optional curvilinear dimension-axis scheme."""
+        ctx = TestCtx(BaseCheck.HIGH, "[AICC002] curvilinear grid axes")
+        medium_ctx = TestCtx(
+            BaseCheck.MEDIUM, "[AICC002] curvilinear grid axes (recommended)"
+        )
+        low_ctx = TestCtx(BaseCheck.LOW, "[AICC002] curvilinear grid axes (advisory)")
+        entries = self.CTgrids.get("axis_entry", {})
+
+        def by_standard_name(key):
+            standard_name = entries.get(key, {}).get("standard_name", "")
+            return next(
+                (
+                    name
+                    for name in horizontal_dims
+                    if name in ds.variables
+                    and _ncattr(ds.variables[name], "standard_name") == standard_name
+                ),
+                None,
+            )
+
+        schemes = []
+        rotated = []
+        for key in ("grid_latitude", "grid_longitude"):
+            name = entries.get(key, {}).get("out_name", "")
+            if name in horizontal_dims and name in ds.variables:
+                rotated.append((name, key))
+        if len(rotated) == 2:
+            schemes.append(("rotated latitude/longitude", rotated))
+
+        for label, keys in (
+            ("projected x/y", ("y", "x")),
+            ("angular projected x/y", ("y_deg", "x_deg")),
+        ):
+            matched = [(by_standard_name(key), key) for key in keys]
+            if all(name is not None for name, _ in matched):
+                schemes.append((label, matched))
+
+        index_entries = {
+            entry.get("out_name", ""): key
+            for key, entry in entries.items()
+            if key.endswith("_index") and entry.get("out_name", "")
+        }
+        index_matches = [
+            (name, index_entries[name])
+            for name in horizontal_dims
+            if name in ds.variables and name in index_entries
+        ]
+        if len(index_matches) == 2:
+            schemes.append(("explicit index axes", index_matches))
+
+        dimension_coordinate_names = [
+            name
+            for name in horizontal_dims
+            if name in ds.variables and ds.variables[name].dimensions == (name,)
+        ]
+        if not schemes and not dimension_coordinate_names:
+            # Bare dimensions are a valid implicit-index representation.
+            ctx.add_pass()
+            return [ctx.to_result()]
+        if not schemes:
+            ctx.add_failure(
+                "Curvilinear horizontal dimension coordinates do not match any "
+                "supported CMIP7_grids.json scheme: rlat/rlon, projected x/y, "
+                "angular projected x/y, or index axes."
+            )
+            return [ctx.to_result()]
+
+        grid_mapping_name = ""
+        data_out_name = self.var_entry.get("out_name", "") if self.var_entry else ""
+        if data_out_name in ds.variables:
+            mapping_attribute = _ncattr(
+                ds.variables[data_out_name], "grid_mapping"
+            )
+            # CF permits ``mapping: coordinate-list`` syntax. The first token
+            # still names the grid-mapping variable.
+            mapping_name = (
+                mapping_attribute.split()[0].rstrip(":")
+                if isinstance(mapping_attribute, str) and mapping_attribute
+                else ""
+            )
+            if mapping_name in ds.variables:
+                grid_mapping_name = _ncattr(ds.variables[mapping_name], "grid_mapping_name")
+        if grid_mapping_name == "rotated_latitude_longitude":
+            selected = next((scheme for scheme in schemes if scheme[0].startswith("rotated")), None)
+            if selected is None:
+                ctx.add_failure(
+                    "grid_mapping_name='rotated_latitude_longitude' requires the "
+                    "rlat/rlon axis representation."
+                )
+                return [ctx.to_result()]
+        elif grid_mapping_name and grid_mapping_name != "latitude_longitude":
+            selected = next(
+                (
+                    scheme
+                    for scheme in schemes
+                    if scheme[0] in {"projected x/y", "angular projected x/y"}
+                ),
+                None,
+            )
+            if selected is None:
+                ctx.add_failure(
+                    f"grid_mapping_name='{grid_mapping_name}' requires projected "
+                    "x/y axes in metres or degrees."
+                )
+                return [ctx.to_result()]
+        else:
+            selected = schemes[0]
+
+        label, variables = selected
+        ctx.add_pass()
+        for name, key in variables:
+            var = ds.variables[name]
+            entry = entries[key]
+            if var.dimensions != (name,):
+                ctx.add_failure(
+                    f"Curvilinear {label} axis '{name}' must be a 1-D coordinate "
+                    f"variable; found {list(var.dimensions)}."
+                )
+            else:
+                ctx.add_pass()
+            _check_coord_attrs(
+                ctx, low_ctx, var, name, entry, medium_ctx=medium_ctx
+            )
+            _check_coord_axis(ctx, low_ctx, var, name, entry)
+            _check_coord_type(ctx, var, name, entry)
+            _check_coord_units(ctx, low_ctx, var, name, entry)
+
+        results = [ctx.to_result()]
+        if medium_ctx.messages:
+            results.append(medium_ctx.to_result())
+        if low_ctx.messages:
+            results.append(low_ctx.to_result())
+        return results
+
     def _check_rectilinear_grid(self, ds, lat_vars, lon_vars, grid_entries):
         """Dimension coordinate lat(lat)/lon(lon) + regular cell bounds."""
         results = []
@@ -487,6 +776,10 @@ class AICC(BaseNCCheck, BaseCheck):
             low_ctx = TestCtx(
                 BaseCheck.LOW,
                 f"[AICC002] {dim_id} dimension coordinate (advisory)",
+            )
+            medium_ctx = TestCtx(
+                BaseCheck.MEDIUM,
+                f"[AICC002] {dim_id} dimension coordinate (recommended)",
             )
 
             dim_matches = [
@@ -536,8 +829,11 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()
 
             # Attributes from CMIP7_coordinate.json
-            _check_coord_attrs(ctx, low_ctx, var, var_name, ce)
+            _check_coord_attrs(
+                ctx, low_ctx, var, var_name, ce, medium_ctx=medium_ctx
+            )
             _check_coord_type(ctx, var, var_name, ce)
+            _check_valid_range(ctx, var, var_name, ce)
 
             level, msg = _compare_units(_ncattr(var, "units"), expected_units)
             if level != "ok":
@@ -546,45 +842,33 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()
 
             results.append(ctx.to_result())
-            if low_ctx.messages:
-                results.append(low_ctx.to_result())
 
             if must_have_bounds:
-                expected_bnds_name = f"{expected_out_name}_bnds"
-                declared_bnds = _ncattr(var, "bounds")
                 bnds_ctx = TestCtx(BaseCheck.HIGH, f"[AICC002] {dim_id} bounds")
-
-                if declared_bnds != expected_bnds_name:
-                    bnds_ctx.add_failure(
-                        f"'{var_name}' bounds={_format_attribute(declared_bnds)}; "
-                        f"expected "
-                        f"'{expected_bnds_name}'."
-                    )
-                else:
-                    bnds_ctx.add_pass()
-
-                if expected_bnds_name not in ds.variables:
-                    bnds_ctx.add_failure(
-                        f"Bounds variable '{expected_bnds_name}' not found."
-                    )
-                else:
-                    bnds_ctx.add_pass()
-                    bnds_var = ds.variables[expected_bnds_name]
+                bnds_name, bnds_var = _check_bounds_reference(
+                    bnds_ctx, medium_ctx, ds, var, var_name
+                )
+                if bnds_var is not None:
                     if bnds_var.ncattrs():
                         bnds_ctx.add_failure(
-                            f"'{expected_bnds_name}' must have no attributes; "
+                            f"'{bnds_name}' must have no attributes; "
                             f"found {list(bnds_var.ncattrs())}."
                         )
                     else:
                         bnds_ctx.add_pass()
                     if bnds_var.ndim != 2 or bnds_var.shape[1] != 2:
                         bnds_ctx.add_failure(
-                            f"'{expected_bnds_name}' must have shape (n, 2); "
+                            f"'{bnds_name}' must have shape (n, 2); "
                             f"found shape {bnds_var.shape}."
                         )
                     else:
                         bnds_ctx.add_pass()
                 results.append(bnds_ctx.to_result())
+
+            if medium_ctx.messages:
+                results.append(medium_ctx.to_result())
+            if low_ctx.messages:
+                results.append(low_ctx.to_result())
 
         return results
 
@@ -602,6 +886,18 @@ class AICC(BaseNCCheck, BaseCheck):
             grid_entries.get(dim_id, {}).get("out_name", dim_id)
             for dim_id in reversed(horizontal_dim_ids)
         ]
+
+    def _expected_curvilinear_horizontal_dimensions(
+        self, ds, horizontal_dim_ids, grid_entries
+    ):
+        """Return the shared two-dimensional latitude/longitude dimensions."""
+        for dim_id in ("latitude", "longitude"):
+            if dim_id not in horizontal_dim_ids:
+                continue
+            name = grid_entries.get(dim_id, {}).get("out_name", dim_id)
+            if name in ds.variables and ds.variables[name].ndim == 2:
+                return list(ds.variables[name].dimensions)
+        return []
 
     # ------------------------------------------------------------------
 
@@ -653,6 +949,11 @@ class AICC(BaseNCCheck, BaseCheck):
                 f"[AICC003] Vertical coordinate '{out_name}' "
                 f"({generic_id}, advisory)",
             )
+            medium_ctx = TestCtx(
+                BaseCheck.MEDIUM,
+                f"[AICC003] Vertical coordinate '{out_name}' "
+                f"({generic_id}, recommended)",
+            )
 
             # Locate lev variable: exact out_name, then cfutil Z vars by standard_name
             if out_name in ds.variables:
@@ -675,6 +976,13 @@ class AICC(BaseNCCheck, BaseCheck):
             ctx.add_pass()
 
             lev_var = ds.variables[lev_var_name]
+            if lev_var_name != out_name or lev_var.dimensions != (out_name,):
+                ctx.add_failure(
+                    f"Generic vertical coordinate must be '{out_name}({out_name})'; "
+                    f"found '{lev_var_name}({', '.join(lev_var.dimensions)})'."
+                )
+            else:
+                ctx.add_pass()
 
             # axis=Z
             if _ncattr(lev_var, "axis") != "Z":
@@ -683,8 +991,11 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()
 
             # Attributes from CMIP7_coordinate.json
-            _check_coord_attrs(ctx, low_ctx, lev_var, lev_var_name, ce)
+            _check_coord_attrs(
+                ctx, low_ctx, lev_var, lev_var_name, ce, medium_ctx=medium_ctx
+            )
             _check_coord_type(ctx, lev_var, lev_var_name, ce)
+            _check_valid_range(ctx, lev_var, lev_var_name, ce)
 
             # units (via udunits-backed comparison)
             if expected_units:
@@ -708,24 +1019,10 @@ class AICC(BaseNCCheck, BaseCheck):
 
             # bounds
             if must_have_bounds:
-                bnds_name = f"{lev_var_name}_bnds"
-                declared_bnds = _ncattr(lev_var, "bounds")
-                if declared_bnds != bnds_name:
-                    ctx.add_failure(
-                        f"'{lev_var_name}' bounds="
-                        f"{_format_attribute(declared_bnds)}; "
-                        f"expected '{bnds_name}'."
-                    )
-                else:
-                    ctx.add_pass()
-
-                if bnds_name not in ds.variables:
-                    ctx.add_failure(
-                        f"Bounds variable '{bnds_name}' for '{lev_var_name}' not found."
-                    )
-                else:
-                    ctx.add_pass()
-                    bnds_var = ds.variables[bnds_name]
+                bnds_name, bnds_var = _check_bounds_reference(
+                    ctx, medium_ctx, ds, lev_var, lev_var_name
+                )
+                if bnds_var is not None:
                     lev_attrs = set(lev_var.ncattrs())
                     allowed_bnds_attrs = {
                         attr
@@ -814,6 +1111,8 @@ class AICC(BaseNCCheck, BaseCheck):
                             )
 
             results.append(ctx.to_result())
+            if medium_ctx.messages:
+                results.append(medium_ctx.to_result())
             if low_ctx.messages:
                 results.append(low_ctx.to_result())
 
@@ -897,6 +1196,14 @@ class AICC(BaseNCCheck, BaseCheck):
                     f"Stored coordinate '{var_name}'",
                     source_ndim=coord_var.ndim,
                 )
+                declared_bounds = _ncattr(coord_var, "bounds")
+                if declared_bounds in ds.variables:
+                    _check_bounds_direction(
+                        ctx,
+                        ds.variables[declared_bounds],
+                        declared_bounds,
+                        stored_direction,
+                    )
 
             implied_positive = _implied_positive(table_standard_name)
             if implied_positive:
@@ -976,7 +1283,7 @@ class AICC(BaseNCCheck, BaseCheck):
             out_name = ce.get("out_name", "time")
             must_have_bounds = ce.get("must_have_bounds", "no") == "yes"
             climatology_setting = ce.get("climatology", "")
-            is_climatology = time_dim_id != "time4" and (
+            is_climatology = (
                 climatology_setting is True
                 or str(climatology_setting).lower() == "yes"
             )
@@ -987,6 +1294,10 @@ class AICC(BaseNCCheck, BaseCheck):
             low_ctx = TestCtx(
                 BaseCheck.LOW,
                 f"[AICC004] Time coordinate ({time_dim_id}, advisory)",
+            )
+            medium_ctx = TestCtx(
+                BaseCheck.MEDIUM,
+                f"[AICC004] Time coordinate ({time_dim_id}, recommended)",
             )
 
             data_out_name = (
@@ -1022,6 +1333,14 @@ class AICC(BaseNCCheck, BaseCheck):
 
             t_var = ds.variables[resolved_t]
 
+            if resolved_t != out_name or t_var.dimensions != (out_name,):
+                ctx.add_failure(
+                    f"Time coordinate must be '{out_name}({out_name})'; found "
+                    f"'{resolved_t}({', '.join(t_var.dimensions)})'."
+                )
+            else:
+                ctx.add_pass()
+
             # axis=T
             if _ncattr(t_var, "axis") != "T":
                 ctx.add_failure(f"'{resolved_t}' must have attribute axis='T'.")
@@ -1029,7 +1348,9 @@ class AICC(BaseNCCheck, BaseCheck):
                 ctx.add_pass()
 
             # Attributes from CMIP7_coordinate.json
-            _check_coord_attrs(ctx, low_ctx, t_var, resolved_t, ce)
+            _check_coord_attrs(
+                ctx, low_ctx, t_var, resolved_t, ce, medium_ctx=medium_ctx
+            )
             _check_coord_type(ctx, t_var, resolved_t, ce)
 
             # Units must match the CMOR template exactly (reference date is free).
@@ -1057,8 +1378,7 @@ class AICC(BaseNCCheck, BaseCheck):
                         )
                     else:
                         ctx.add_pass()
-                        # verify the bounds variable exists (cfutil agrees)
-                        clim_bnds = cfutil.get_climatology_variable(ds)
+                        # Verify the referenced climatology bounds variable exists.
                         if clim_attr not in ds.variables:
                             ctx.add_failure(
                                 f"Climatology bounds variable "
@@ -1067,26 +1387,30 @@ class AICC(BaseNCCheck, BaseCheck):
                             )
                         else:
                             ctx.add_pass()
+                    regular_bounds = _ncattr(t_var, "bounds")
+                    if regular_bounds:
+                        ctx.add_failure(
+                            f"Climatological time coordinate '{resolved_t}' must not "
+                            f"have a 'bounds' attribute; found "
+                            f"{_format_attribute(regular_bounds)}."
+                        )
+                    else:
+                        ctx.add_pass()
+                    regular_name = f"{out_name}_bnds"
+                    if regular_name in ds.variables and clim_attr != regular_name:
+                        ctx.add_failure(
+                            f"Climatological time coordinate '{resolved_t}' must not "
+                            f"define regular bounds variable '{regular_name}' unless "
+                            f"its 'climatology' attribute names that same variable."
+                        )
+                    else:
+                        ctx.add_pass()
                 else:
                     # Regular time bounds
-                    bnds_name = f"{out_name}_bnds"
-                    declared_bnds = _ncattr(t_var, "bounds")
-                    if declared_bnds != bnds_name:
-                        ctx.add_failure(
-                            f"'{resolved_t}' bounds="
-                            f"{_format_attribute(declared_bnds)}; "
-                            f"expected '{bnds_name}'."
-                        )
-                    else:
-                        ctx.add_pass()
-
-                    if bnds_name not in ds.variables:
-                        ctx.add_failure(
-                            f"Time bounds variable '{bnds_name}' not found in file."
-                        )
-                    else:
-                        ctx.add_pass()
-                        bnds_var = ds.variables[bnds_name]
+                    bnds_name, bnds_var = _check_bounds_reference(
+                        ctx, medium_ctx, ds, t_var, resolved_t
+                    )
+                    if bnds_var is not None:
                         if bnds_var.ncattrs():
                             ctx.add_failure(
                                 f"'{bnds_name}' must have no attributes; "
@@ -1096,6 +1420,8 @@ class AICC(BaseNCCheck, BaseCheck):
                             ctx.add_pass()
 
             results.append(ctx.to_result())
+            if medium_ctx.messages:
+                results.append(medium_ctx.to_result())
             if low_ctx.messages:
                 results.append(low_ctx.to_result())
 
@@ -1123,7 +1449,6 @@ class AICC(BaseNCCheck, BaseCheck):
         # Use cfutil to classify what is in the file
         aux_coord_names = set(cfutil.get_auxiliary_coordinate_variables(ds))
         dim_coord_names = set(cfutil.get_coordinate_variables(ds))
-        bnds_map = cfutil.get_cell_boundary_map(ds)  # {var_name: bnds_name}
 
         for dim_id in other_dims:
             ce = axis_entries.get(dim_id)
@@ -1142,7 +1467,6 @@ class AICC(BaseNCCheck, BaseCheck):
             requested = _as_list(ce.get("requested", []))
             requested_bounds = _as_list(ce.get("requested_bounds", []))
             must_have_bounds = ce.get("must_have_bounds", "no") == "yes"
-            expected_units = ce.get("units", "")
             is_character = coord_type == "character"
             is_scalar = _is_scalar_coord(ce)
 
@@ -1156,8 +1480,11 @@ class AICC(BaseNCCheck, BaseCheck):
             else:
                 low = _check_multi_value_coord(
                     ctx, ds, out_name, ce, requested, requested_bounds,
-                    must_have_bounds, is_character, expected_units, bnds_map,
+                    must_have_bounds, is_character, data_out_name,
                 )
+
+            if dim_id == "site":
+                _check_site_coordinate(ctx, ds, out_name, data_out_name)
 
             results.append(ctx.to_result())
             results.extend(low)
@@ -1385,8 +1712,8 @@ class AICC(BaseNCCheck, BaseCheck):
                 if dim_id in self.requested_dims:
                     allowed_coordinates.update(candidates)
 
-        # Unstructured horizontal coordinates are auxiliary coordinates.
-        elif self._grid_type == "unstructured":
+        # Unstructured and curvilinear horizontal coordinates are auxiliary.
+        elif self._grid_type in {"unstructured", "curvilinear"}:
             dim_coord_names = set(cfutil.get_coordinate_variables(ds))
             for dim_id, candidates in (
                 ("latitude", cfutil.get_true_latitude_variables(ds)),
@@ -1397,7 +1724,9 @@ class AICC(BaseNCCheck, BaseCheck):
                 allowed_coordinates.update(
                     name
                     for name in candidates
-                    if name not in dim_coord_names and ds.variables[name].ndim == 1
+                    if name not in dim_coord_names
+                    and ds.variables[name].ndim
+                    == (1 if self._grid_type == "unstructured" else 2)
                 )
 
         for dim_id in self.requested_dims:
@@ -1413,7 +1742,15 @@ class AICC(BaseNCCheck, BaseCheck):
                 continue
 
             out_name = ce.get("out_name", dim_id)
-            if _is_scalar_coord(ce):
+            if dim_id == "site":
+                allowed_coordinates.update(
+                    name
+                    for name in listed_coordinates
+                    if name in ds.variables
+                    and _ncattr(ds.variables[name], "standard_name")
+                    in {"latitude", "longitude"}
+                )
+            elif _is_scalar_coord(ce):
                 if out_name in ds.variables:
                     allowed_coordinates.add(out_name)
                 else:
@@ -2010,7 +2347,7 @@ def _vertical_config_ctx(ds, name: str) -> TestCtx:
         f"Vertical checks cannot run because source_id "
         f"{_format_attribute(source_id)} is not registered in the model "
         f"configuration. Add a matching source_id key to the default "
-        f"configuration or pass it through the 'model_config' option."
+        f"configuration or pass it through the 'vertical_config' option."
     )
     return ctx
 
@@ -2033,7 +2370,14 @@ def _check_formula_var_attrs(
         else:
             ctx.add_pass()
 
-    _check_coord_attrs(ctx, low_ctx, var, var_name, ft_entry)
+    _check_coord_attrs(
+        ctx,
+        low_ctx,
+        var,
+        var_name,
+        ft_entry,
+        enforce_long_name_fallback=False,
+    )
 
 
 def _check_coord_attrs(
@@ -2043,8 +2387,10 @@ def _check_coord_attrs(
     var_name: str,
     ce: dict,
     missing_ok: bool = False,
+    medium_ctx: TestCtx | None = None,
+    enforce_long_name_fallback: bool = True,
 ):
-    """Check standard_name and advisory long_name attributes."""
+    """Check naming attributes with the severities prescribed by CMIP7."""
     expected_sn = ce.get("standard_name", "")
     if expected_sn:
         actual_sn = _ncattr(var, "standard_name")
@@ -2057,10 +2403,31 @@ def _check_coord_attrs(
             )
         else:
             ctx.add_pass()
+    elif _ncattr(var, "standard_name") and not missing_ok:
+        low_ctx.add_failure(
+            f"'{var_name}' standard_name="
+            f"{_format_attribute(_ncattr(var, 'standard_name'))}, but the CMOR "
+            f"entry does not prescribe a standard_name. Verify that this "
+            f"model-dependent metadata is appropriate."
+        )
 
     expected_ln = ce.get("long_name", "")
-    if expected_ln:
-        actual_ln = _ncattr(var, "long_name")
+    actual_ln = _ncattr(var, "long_name")
+    if not expected_sn and not missing_ok and enforce_long_name_fallback:
+        if not actual_ln:
+            ctx.add_failure(
+                f"'{var_name}' must have a long_name because the CMOR entry "
+                f"does not define a standard_name."
+            )
+        else:
+            ctx.add_pass()
+            if expected_ln and actual_ln != expected_ln:
+                target_ctx = medium_ctx or low_ctx
+                target_ctx.add_failure(
+                    f"'{var_name}' long_name={_format_attribute(actual_ln)}; "
+                    f"expected '{expected_ln}'."
+                )
+    elif expected_ln:
         if actual_ln and actual_ln != expected_ln:
             low_ctx.add_failure(
                 f"'{var_name}' long_name={_format_attribute(actual_ln)}; "
@@ -2071,6 +2438,186 @@ def _check_coord_attrs(
                 f"'{var_name}' long_name={_format_attribute(actual_ln)}; "
                 f"expected '{expected_ln}'."
             )
+
+
+def _check_coord_axis(ctx: TestCtx, low_ctx: TestCtx, var, var_name: str, ce: dict):
+    """Check a prescribed axis and warn about an unprescribed one."""
+    expected = ce.get("axis", "")
+    actual = _ncattr(var, "axis")
+    if expected:
+        if actual != expected:
+            ctx.add_failure(
+                f"'{var_name}' axis={_format_attribute(actual)}; expected '{expected}'."
+            )
+        else:
+            ctx.add_pass()
+    elif actual:
+        low_ctx.add_failure(
+            f"'{var_name}' axis={_format_attribute(actual)}, but the CMOR entry "
+            f"does not prescribe an axis. Verify that the extra attribute is valid."
+        )
+
+
+def _check_coord_units(ctx: TestCtx, low_ctx: TestCtx, var, var_name: str, ce: dict):
+    """Check prescribed units and warn about units absent from the table entry."""
+    expected = ce.get("units", "")
+    actual = _ncattr(var, "units")
+    if expected:
+        level, msg = _compare_units(actual, expected)
+        if level != "ok":
+            ctx.add_failure(f"'{var_name}' units: {msg}")
+        else:
+            ctx.add_pass()
+    elif actual:
+        low_ctx.add_failure(
+            f"'{var_name}' units={_format_attribute(actual)}, but the CMOR entry "
+            f"does not prescribe units. Verify that the extra attribute is valid."
+        )
+
+
+def _check_coord_positive_with_warning(
+    ctx: TestCtx, low_ctx: TestCtx, var, var_name: str, ce: dict
+):
+    """Check prescribed positive metadata and warn when it is unprescribed."""
+    expected = ce.get("positive", "")
+    actual = _ncattr(var, "positive")
+    if expected:
+        _check_coord_table_positive(ctx, var, var_name, ce)
+    elif actual:
+        low_ctx.add_failure(
+            f"'{var_name}' positive={_format_attribute(actual)}, but the CMOR entry "
+            f"does not prescribe positive. Verify that the extra attribute is valid."
+        )
+
+
+def _check_valid_range(ctx: TestCtx, var, var_name: str, ce: dict):
+    """Check all numeric coordinate values against independent table limits."""
+    valid_min = ce.get("valid_min", "")
+    valid_max = ce.get("valid_max", "")
+    if valid_min in ("", None) and valid_max in ("", None):
+        return
+    try:
+        values = np.ma.asarray(var[...], dtype="float64")
+        values = np.asarray(values.compressed(), dtype="float64")
+    except (TypeError, ValueError) as exc:
+        ctx.add_failure(f"Could not check valid range of '{var_name}': {exc}.")
+        return
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        ctx.add_failure(f"Could not check valid range of '{var_name}': no finite values.")
+        return
+    if valid_min not in ("", None):
+        lower = float(valid_min)
+        slack = 1.0e-6 * abs(lower)
+        bad = finite < lower - slack
+        if np.any(bad):
+            ctx.add_failure(
+                f"'{var_name}' contains value {finite[bad].min()} below valid_min="
+                f"{lower}."
+            )
+        else:
+            ctx.add_pass()
+    if valid_max not in ("", None):
+        upper = float(valid_max)
+        slack = 1.0e-6 * abs(upper)
+        bad = finite > upper + slack
+        if np.any(bad):
+            ctx.add_failure(
+                f"'{var_name}' contains value {finite[bad].max()} above valid_max="
+                f"{upper}."
+            )
+        else:
+            ctx.add_pass()
+
+
+def _check_bounds_direction(
+    ctx: TestCtx, bnds_var, bnds_name: str, stored_direction: str
+):
+    """Check the order within every size-two bounds pair."""
+    if stored_direction not in {"increasing", "decreasing"}:
+        return
+    try:
+        bounds = np.ma.asarray(bnds_var[:], dtype="float64")
+        if bounds.shape[-1] != 2:
+            return  # shape is owned by the structural check
+        pairs = np.asarray(bounds.filled(np.nan), dtype="float64").reshape(-1, 2)
+        differences = pairs[:, 1] - pairs[:, 0]
+        valid = np.all(differences > 0) if stored_direction == "increasing" else np.all(
+            differences < 0
+        )
+    except (TypeError, ValueError):
+        return
+    if valid:
+        ctx.add_pass()
+    else:
+        expected = "lower-to-upper" if stored_direction == "increasing" else "upper-to-lower"
+        ctx.add_failure(
+            f"Bounds variable '{bnds_name}' is not ordered {expected} consistently "
+            f"with stored_direction='{stored_direction}'."
+        )
+
+
+def _check_bounds_reference(
+    ctx: TestCtx,
+    medium_ctx: TestCtx,
+    ds,
+    coord_var,
+    coord_name: str,
+):
+    """Validate a bounds reference and return the referenced variable, if any."""
+    expected_name = f"{coord_name}_bnds"
+    declared = _ncattr(coord_var, "bounds")
+    if not declared:
+        ctx.add_failure(
+            f"'{coord_name}' must have a 'bounds' attribute naming its bounds variable."
+        )
+        return None, None
+    ctx.add_pass()
+    if declared != expected_name:
+        medium_ctx.add_failure(
+            f"'{coord_name}' bounds={_format_attribute(declared)}; recommended name "
+            f"is '{expected_name}'."
+        )
+    if declared not in ds.variables:
+        ctx.add_failure(
+            f"Bounds variable {_format_attribute(declared)} for '{coord_name}' not found."
+        )
+        return declared, None
+    ctx.add_pass()
+    return declared, ds.variables[declared]
+
+
+def _check_bounds_structure(
+    ctx: TestCtx,
+    bnds_var,
+    bnds_name: str,
+    coord_var,
+    ce: dict,
+    *,
+    scalar: bool = False,
+):
+    """Check bounds dimensions, size-two axis, storage type, and direction."""
+    if scalar:
+        valid_shape = bnds_var.ndim == 1 and bnds_var.shape == (2,)
+        expected = "one size-2 dimension"
+    else:
+        valid_shape = (
+            coord_var.ndim == 1
+            and bnds_var.ndim == 2
+            and bnds_var.dimensions[0] == coord_var.dimensions[0]
+            and bnds_var.shape[0] == coord_var.shape[0]
+            and bnds_var.shape[1] == 2
+        )
+        expected = f"dimensions ('{coord_var.dimensions[0]}', <size-2>)"
+    if not valid_shape:
+        ctx.add_failure(
+            f"Bounds variable '{bnds_name}' has dimensions "
+            f"{list(bnds_var.dimensions)} and shape {bnds_var.shape}; expected {expected}."
+        )
+    else:
+        ctx.add_pass()
+    _check_coord_type(ctx, bnds_var, bnds_name, ce)
+    _check_bounds_direction(ctx, bnds_var, bnds_name, ce.get("stored_direction", ""))
 
 
 def _check_coord_type(
@@ -2127,6 +2674,9 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                          bounds_values: str = "") -> list:
     """Check a scalar coordinate. Returns list[Result] for LOW advisories."""
     low_ctx = TestCtx(BaseCheck.LOW, f"[AICC005] Coordinate '{out_name}' (advisory)")
+    medium_ctx = TestCtx(
+        BaseCheck.MEDIUM, f"[AICC005] Coordinate '{out_name}' (recommended)"
+    )
 
     # Locate by exact out_name, fall back to standard_name search
     coord_var_name = out_name if out_name in ds.variables else None
@@ -2143,11 +2693,22 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
         )
         return []
     ctx.add_pass()
+    if coord_var_name != out_name:
+        ctx.add_failure(
+            f"Scalar coordinate '{coord_var_name}' was identified by metadata, but "
+            f"CMOR requires the variable name '{out_name}'."
+        )
 
     coord_var = ds.variables[coord_var_name]
-    _check_coord_attrs(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_attrs(
+        ctx, low_ctx, coord_var, coord_var_name, ce, medium_ctx=medium_ctx
+    )
     _check_coord_type(ctx, coord_var, coord_var_name, ce)
-    _check_coord_table_positive(ctx, coord_var, coord_var_name, ce)
+    _check_coord_axis(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_units(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_positive_with_warning(ctx, low_ctx, coord_var, coord_var_name, ce)
+    if not is_character:
+        _check_valid_range(ctx, coord_var, coord_var_name, ce)
 
     if is_character:
         dims = list(coord_var.dimensions)
@@ -2182,26 +2743,24 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                     if actual == expected_val:
                         ctx.add_pass()
                     else:
-                        valid_min_s = ce.get("valid_min", "")
-                        valid_max_s = ce.get("valid_max", "")
-                        if valid_min_s and valid_max_s:
-                            vmin, vmax = float(valid_min_s), float(valid_max_s)
-                            if vmin <= actual <= vmax:
-                                # Within valid range: advisory only
-                                ctx.add_pass()
-                                low_ctx.add_failure(
-                                    f"'{coord_var_name}' value={actual} differs from "
-                                    f"expected {expected_val} but is within valid range "
-                                    f"[{vmin}, {vmax}]."
-                                )
-                            else:
-                                ctx.add_failure(
-                                    f"'{coord_var_name}' value={actual}; expected "
-                                    f"{expected_val} (valid range [{vmin}, {vmax}])."
-                                )
+                        valid_min = ce.get("valid_min", "")
+                        valid_max = ce.get("valid_max", "")
+                        within_limits = bool(valid_min or valid_max)
+                        if valid_min:
+                            within_limits = within_limits and actual >= float(valid_min)
+                        if valid_max:
+                            within_limits = within_limits and actual <= float(valid_max)
+                        if within_limits:
+                            ctx.add_pass()
+                            low_ctx.add_failure(
+                                f"'{coord_var_name}' value={actual} differs from "
+                                f"expected {expected_val} but is within the prescribed "
+                                f"valid range."
+                            )
                         else:
                             ctx.add_failure(
-                                f"'{coord_var_name}' value={actual}; expected {expected_val}."
+                                f"'{coord_var_name}' value={actual}; expected "
+                                f"{expected_val}."
                             )
                 except (TypeError, ValueError):
                     ctx.add_pass()
@@ -2221,33 +2780,13 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
 
     # Scalar bounds
     if must_have_bounds and not is_character:
-        bnds_name = f"{out_name}_bnds"
-        coord_var_ref = ds.variables.get(coord_var_name)
-        if coord_var_ref is not None:
-            declared_bnds = _ncattr(coord_var_ref, "bounds")
-            if declared_bnds != bnds_name:
-                ctx.add_failure(
-                    f"'{coord_var_name}' bounds="
-                    f"{_format_attribute(declared_bnds)}; expected '{bnds_name}'."
-                )
-            else:
-                ctx.add_pass()
-
-        if bnds_name not in ds.variables:
-            ctx.add_failure(
-                f"Scalar bounds variable '{bnds_name}' for '{out_name}' not found."
+        bnds_name, bnds_var = _check_bounds_reference(
+            ctx, medium_ctx, ds, coord_var, coord_var_name
+        )
+        if bnds_var is not None:
+            _check_bounds_structure(
+                ctx, bnds_var, bnds_name, coord_var, ce, scalar=True
             )
-        else:
-            ctx.add_pass()
-            bnds_var = ds.variables[bnds_name]
-            if bnds_var.ncattrs():
-                ctx.add_failure(
-                    f"'{bnds_name}' must have no attributes; "
-                    f"found: {list(bnds_var.ncattrs())}."
-                )
-            else:
-                ctx.add_pass()
-
             if bounds_values and value:
                 try:
                     parts = bounds_values.split()
@@ -2255,47 +2794,33 @@ def _check_scalar_coord(ctx: TestCtx, ds, dim_id: str, out_name: str,
                     file_bnds = np.asarray(bnds_var[:]).flatten()
                     act_lo, act_hi = float(file_bnds[0]), float(file_bnds[1])
 
-                    tol_str = ce.get("tolerance", "")
-                    if tol_str:
-                        # CMOR tolerance for scalar (i=0, one value)
-                        scalar_val = float(value)
-                        tol = _cmor_tol_val(0, [scalar_val], [(exp_lo, exp_hi)], float(tol_str))
-                        lo_diff = abs(act_lo - exp_lo)
-                        hi_diff = abs(act_hi - exp_hi)
-                        if lo_diff > tol or hi_diff > tol:
-                            ctx.add_failure(
-                                f"'{bnds_name}' bounds=[{act_lo}, {act_hi}] outside "
-                                f"tolerance {tol:.3g} of expected [{exp_lo}, {exp_hi}]."
-                            )
-                        else:
-                            ctx.add_pass()
-                            if lo_diff > 0 or hi_diff > 0:
-                                low_ctx.add_failure(
-                                    f"'{bnds_name}' bounds=[{act_lo}, {act_hi}] within "
-                                    f"tolerance but not exact; expected [{exp_lo}, {exp_hi}]."
-                                )
+                    if act_lo != exp_lo or act_hi != exp_hi:
+                        ctx.add_failure(
+                            f"'{bnds_name}' bounds=[{act_lo}, {act_hi}]; expected "
+                            f"exact scalar bounds [{exp_lo}, {exp_hi}]."
+                        )
                     else:
-                        default_tol = 1e-6 * max(1.0, abs(exp_lo), abs(exp_hi))
-                        if not (np.isclose(act_lo, exp_lo, atol=default_tol)
-                                and np.isclose(act_hi, exp_hi, atol=default_tol)):
-                            ctx.add_failure(
-                                f"'{bnds_name}' bounds=[{act_lo}, {act_hi}]; "
-                                f"expected [{exp_lo}, {exp_hi}]."
-                            )
-                        else:
-                            ctx.add_pass()
+                        ctx.add_pass()
                 except Exception as exc:
                     ctx.add_failure(f"Could not check bounds_values of '{bnds_name}': {exc}")
 
-    return [low_ctx.to_result()] if low_ctx.messages else []
+    results = []
+    if medium_ctx.messages:
+        results.append(medium_ctx.to_result())
+    if low_ctx.messages:
+        results.append(low_ctx.to_result())
+    return results
 
 
 def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                               requested: list, requested_bounds: list,
                               must_have_bounds: bool, is_character: bool,
-                              expected_units: str, bnds_map: dict) -> list:
+                              data_out_name: str = "") -> list:
     """Check a multi-value coordinate. Returns list[Result] for LOW advisories."""
     low_ctx = TestCtx(BaseCheck.LOW, f"[AICC005] Coordinate '{out_name}' (advisory)")
+    medium_ctx = TestCtx(
+        BaseCheck.MEDIUM, f"[AICC005] Coordinate '{out_name}' (recommended)"
+    )
 
     expected_var_name = "sector" if is_character else out_name
     coord_var_name = expected_var_name if expected_var_name in ds.variables else None
@@ -2323,9 +2848,13 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
     coord_var = ds.variables[coord_var_name]
 
     # Verify standard_name and long_name against the table
-    _check_coord_attrs(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_attrs(
+        ctx, low_ctx, coord_var, coord_var_name, ce, medium_ctx=medium_ctx
+    )
     _check_coord_type(ctx, coord_var, coord_var_name, ce)
-    _check_coord_table_positive(ctx, coord_var, coord_var_name, ce)
+    _check_coord_axis(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_positive_with_warning(ctx, low_ctx, coord_var, coord_var_name, ce)
+    _check_coord_units(ctx, low_ctx, coord_var, coord_var_name, ce)
 
     if is_character:
         # Dims must be (out_name, strlen)
@@ -2338,6 +2867,17 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
             )
         else:
             ctx.add_pass()
+
+        if data_out_name and data_out_name in ds.variables:
+            coordinates = _ncattr(ds.variables[data_out_name], "coordinates")
+            listed = coordinates.split() if coordinates else []
+            if coord_var_name not in listed:
+                ctx.add_failure(
+                    f"'{data_out_name}' 'coordinates' attribute must include text "
+                    f"auxiliary coordinate '{coord_var_name}'."
+                )
+            else:
+                ctx.add_pass()
 
         if requested:
             try:
@@ -2358,13 +2898,15 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
         tol_str = ce.get("tolerance", "")
         tol_factor = float(tol_str) if tol_str else None
 
-        # units via udunits
-        if expected_units:
-            level, msg = _compare_units(_ncattr(coord_var, "units"), expected_units)
-            if level != "ok":
-                ctx.add_failure(f"'{coord_var_name}' units: {msg}")
-            else:
-                ctx.add_pass()
+        if coord_var_name != out_name or coord_var.dimensions != (out_name,):
+            ctx.add_failure(
+                f"Numeric 1-D coordinate must be '{out_name}({out_name})'; found "
+                f"'{coord_var_name}({', '.join(coord_var.dimensions)})'."
+            )
+        else:
+            ctx.add_pass()
+
+        _check_valid_range(ctx, coord_var, coord_var_name, ce)
 
         # Build requested bound pairs aligned with requested values (for tol calc)
         req_floats = [float(r) for r in requested] if requested else []
@@ -2406,42 +2948,23 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                 ctx.add_failure(f"Could not check values of '{coord_var_name}': {exc}")
 
         if must_have_bounds:
-            bnds_name = (bnds_map.get(coord_var_name)
-                         or _ncattr(coord_var, "bounds")
-                         or f"{coord_var_name}_bnds")
-            declared_bnds = _ncattr(coord_var, "bounds")
-            if not declared_bnds:
-                ctx.add_failure(
-                    f"'{coord_var_name}' must have a 'bounds' attribute "
-                    f"set to '{bnds_name}'."
-                )
-            else:
-                ctx.add_pass()
-
-            if bnds_name not in ds.variables:
-                ctx.add_failure(
-                    f"Bounds variable '{bnds_name}' for '{coord_var_name}' not found."
-                )
-            else:
-                ctx.add_pass()
-                bnds_var = ds.variables[bnds_name]
-                if bnds_var.ncattrs():
-                    ctx.add_failure(
-                        f"'{bnds_name}' must have no attributes; "
-                        f"found {list(bnds_var.ncattrs())}."
-                    )
-                else:
-                    ctx.add_pass()
-
+            bnds_name, bnds_var = _check_bounds_reference(
+                ctx, medium_ctx, ds, coord_var, coord_var_name
+            )
+            if bnds_var is not None:
+                _check_bounds_structure(ctx, bnds_var, bnds_name, coord_var, ce)
                 if req_pairs:
                     try:
                         file_bnds = np.asarray(bnds_var[:]).reshape(-1, 2)
                         outside_tol_bnds, within_tol_bnds = [], []
                         for i, (exp_lo, exp_hi) in enumerate(req_pairs):
                             if tol_factor is not None:
-                                tol = _cmor_tol_val(i, req_floats, req_pairs, tol_factor)
+                                lo_tol, hi_tol = _cmor_bound_tol_vals(
+                                    i, req_pairs, tol_factor
+                                )
                                 matches = [fb for fb in file_bnds
-                                           if abs(fb[0] - exp_lo) <= tol and abs(fb[1] - exp_hi) <= tol]
+                                           if abs(fb[0] - exp_lo) <= lo_tol
+                                           and abs(fb[1] - exp_hi) <= hi_tol]
                                 if not matches:
                                     outside_tol_bnds.append((exp_lo, exp_hi))
                                 elif not any(fb[0] == exp_lo and fb[1] == exp_hi for fb in file_bnds):
@@ -2466,4 +2989,60 @@ def _check_multi_value_coord(ctx: TestCtx, ds, out_name: str, ce: dict,
                             f"Could not check bounds of '{coord_var_name}': {exc}"
                         )
 
-    return [low_ctx.to_result()] if low_ctx.messages else []
+    results = []
+    if medium_ctx.messages:
+        results.append(medium_ctx.to_result())
+    if low_ctx.messages:
+        results.append(low_ctx.to_result())
+    return results
+
+
+def _check_site_coordinate(
+    ctx: TestCtx, ds, site_dimension: str, data_out_name: str
+):
+    """Check the latitude/longitude auxiliary coordinates required for sites."""
+    if not data_out_name or data_out_name not in ds.variables:
+        return  # another checker owns the missing data-variable finding
+
+    data_var = ds.variables[data_out_name]
+    coordinates = _ncattr(data_var, "coordinates")
+    listed = coordinates.split() if coordinates else []
+    if not listed:
+        ctx.add_failure(
+            f"Site variable '{data_out_name}' must have a 'coordinates' attribute "
+            f"listing latitude and longitude auxiliary coordinates."
+        )
+        return
+
+    for standard_name, expected_units in (
+        ("latitude", "degrees_north"),
+        ("longitude", "degrees_east"),
+    ):
+        matches = [
+            name
+            for name in listed
+            if name in ds.variables
+            and _ncattr(ds.variables[name], "standard_name") == standard_name
+        ]
+        if not matches:
+            ctx.add_failure(
+                f"Site variable '{data_out_name}' coordinates={listed} must include "
+                f"an existing auxiliary coordinate with standard_name="
+                f"'{standard_name}'."
+            )
+            continue
+        ctx.add_pass()
+        name = matches[0]
+        var = ds.variables[name]
+        if var.dimensions != (site_dimension,):
+            ctx.add_failure(
+                f"Site {standard_name} coordinate '{name}' must be a function of "
+                f"dimension '{site_dimension}'; found {list(var.dimensions)}."
+            )
+        else:
+            ctx.add_pass()
+        level, message = _compare_units(_ncattr(var, "units"), expected_units)
+        if level != "ok":
+            ctx.add_failure(f"Site {standard_name} coordinate '{name}' units: {message}")
+        else:
+            ctx.add_pass()

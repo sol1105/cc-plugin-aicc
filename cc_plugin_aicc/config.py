@@ -1,9 +1,9 @@
 """
-config.py — Model configuration and resolution helpers for AICC.
+config.py — Vertical and horizontal configuration helpers for AICC.
 
-DEFAULT_CONFIG and DEFAULT_GRID_CONFIG are the public entry points. Extend or
-replace them (or pass a custom dict / JSON path through the checker options) to
-support additional modelling systems and grid labels.
+DEFAULT_VERTICAL_CONFIG and DEFAULT_GRID_CONFIG are the public entry points.
+Extend or replace them (or pass a custom dict / JSON path through the checker
+options) to support additional modelling systems and grid labels.
 """
 
 import json
@@ -84,9 +84,9 @@ DEFAULT_GRID_CONFIG = {
 # Longer (more-specific) source_id keys take precedence over shorter ones,
 # so "AWI-ESM" beats "AWI" for source_id "AWI-ESM-2-3-Veg".
 #
-# Pass a custom dict or path to a JSON file via the 'model_config' option.
+# Pass a custom dict or path to a JSON file via the 'vertical_config' option.
 
-DEFAULT_CONFIG = {
+DEFAULT_VERTICAL_CONFIG = {
     "AWI-ESM": {
         "vertical": {
             "alevel": "alternate_hybrid_sigma",
@@ -111,8 +111,8 @@ DEFAULT_CONFIG = {
 # ---------------------------------------------------------------------------
 
 
-def resolve_model_config(source_id: str, config: dict) -> tuple:
-    """Return (matched_key, model_dict) for the most-specific config entry.
+def resolve_vertical_config(source_id: str, config: dict) -> tuple:
+    """Return the most-specific source key and its vertical configuration.
 
     All config keys that are substrings of source_id are candidates;
     the longest key wins (most specific). Returns (None, None) if no match.
@@ -130,10 +130,10 @@ def resolve_grid_type(grid_label: str, grid_config: dict) -> tuple:
     return None, False
 
 
-def load_model_config(option_value) -> dict:
-    """Load a model config from a dict, a JSON file path, or return DEFAULT_CONFIG."""
+def load_vertical_config(option_value) -> dict:
+    """Load vertical config from a dict, JSON path, or use the defaults."""
     if option_value is None:
-        return DEFAULT_CONFIG
+        return DEFAULT_VERTICAL_CONFIG
     if isinstance(option_value, dict):
         return option_value
     with open(option_value) as fh:

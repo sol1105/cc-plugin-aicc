@@ -17,7 +17,7 @@ targeted checks:
 | Check | What is verified |
 |---|---|
 | `check_branded_variable` | Identification of the requested variable in the CMIP7 tables |
-| `check_grid` | Rectilinear or unstructured latitude/longitude coordinates and bounds |
+| `check_grid` | Rectilinear, unstructured, or curvilinear latitude/longitude coordinates and bounds |
 | `check_vertical` | Generic vertical levels (alevel/alevhalf/olevel/olevhalf), formula_terms |
 | `check_vertical_direction` | Stored and formula-derived direction of generic vertical levels |
 | `check_time` | Time axis, units, calendar, bounds / CF climatology |
@@ -27,7 +27,7 @@ targeted checks:
 | `check_coordinates_attribute` | No unexpected entries in the data variable's `coordinates` attribute |
 | `check_quantization` | CF-1.12 lossy quantization metadata and precision parameters |
 
-Further models can be configured through the `model_config` checker option or by
+Further models can be configured through the `vertical_config` checker option or by
 extending the vertical defaults in `config.py`.
 
 Currently, AWI-ESM is configured to verify `alternate_hybrid_sigma` /
@@ -39,9 +39,10 @@ the `source_id` global attribute.
 CMIP7 `grid_label` values are registered globally rather than per model. All
 currently registered labels from `g100` through `g236` are classified as
 `"rectilinear"`, `"unstructured"`, or `"curvilinear"`. Coordinate validation is
-currently implemented for rectilinear and unstructured grids; curvilinear labels
-are recognized and reported as not yet implemented. The registry can be replaced
-through the `grid_config` checker option or extended in `config.py`.
+implemented for all three topologies. Curvilinear grids may use rotated
+`rlat`/`rlon`, projected metre or angular `x`/`y`, explicit index axes, or bare
+implicit-index dimensions. The registry can be replaced through the `grid_config`
+checker option or extended in `config.py`.
 
 ## Requirements
 
@@ -65,6 +66,8 @@ python -m pip install -e .
 
 ## Usage
 
+### Basic invocation
+
 ```bash
 # point to CMIP7 tables via option
 compliance-checker -t aicc -c strict \
@@ -80,3 +83,89 @@ The `tables` option (or `CMIP7_TABLES_PATH` environment variable) must point
 to the directory containing the CMIP7 JSON tables
 (`CMIP7_coordinate.json`, `CMIP7_grids.json`, `CMIP7_formula_terms.json`,
 and the variable tables such as `CMIP7_atmos.json`).
+
+### Grid configuration
+
+The optional `grid_config` file maps each permitted `grid_label` global
+attribute to the horizontal grid topology that AICC should validate. Supported
+values are `"rectilinear"`, `"unstructured"`, and `"curvilinear"`.
+
+Example `grid_config.json`:
+
+```json
+{
+  "g122": "curvilinear",
+  "g456": "rectilinear",
+  "g567": "unstructured"
+}
+```
+
+A custom file replaces the built-in registry; it does not extend it. It must
+therefore contain every `grid_label` that should be accepted during the run.
+
+### Vertical configuration
+
+The optional vertical model configuration maps generic CMIP7 level IDs to
+entries in `CMIP7_coordinate.json`. Its top-level keys are matched as substrings
+of the file's `source_id` global attribute. If several keys match, the longest
+and therefore most specific key is selected.
+
+Example `vertical_config.json`:
+
+```json
+{
+  "MY-MODEL": {
+    "vertical": {
+      "alevel": "alternate_hybrid_sigma",
+      "alevhalf": "alternate_hybrid_sigma_half",
+      "olevel": "depth_coord",
+      "olevhalf": "depth_coord_half"
+    }
+  },
+  "MY-MODEL-SPECIAL": {
+    "vertical": {
+      "alevel": "modified_sleve_model_level",
+      "alevhalf": "modified_sleve_half_level",
+      "olevel": "depth_coord",
+      "olevhalf": "depth_coord_half"
+    }
+  }
+}
+```
+
+For example, `source_id="MY-MODEL-SPECIAL-1"` selects the
+`MY-MODEL-SPECIAL` entry. The inner values must be axis-entry keys present in
+the CMIP7 coordinate table. A bare mapping containing only `alevel`,
+`alevhalf`, `olevel`, and `olevhalf` is not sufficient because it provides no
+`source_id` match.
+
+### Invocation with all configuration files
+
+```bash
+compliance-checker -t aicc -c strict \
+  --option aicc:tables:/path/to/cmip7-cmor-tables/tables \
+  --option aicc:grid_config:/path/to/grid_config.json \
+  --option aicc:vertical_config:/path/to/vertical_config.json \
+  myfile.nc
+```
+
+The short `-O` form is equivalent:
+
+```bash
+compliance-checker -t aicc -c strict \
+  -O aicc:tables:/path/to/cmip7-cmor-tables/tables \
+  -O aicc:grid_config:/path/to/grid_config.json \
+  -O aicc:vertical_config:/path/to/vertical_config.json \
+  myfile.nc
+```
+
+To run AICC together with another installed checker, repeat `--test`. For
+example:
+
+```bash
+compliance-checker -t cmip7 -t aicc -c strict \
+  -O aicc:tables:/path/to/cmip7-cmor-tables/tables \
+  -O aicc:grid_config:/path/to/grid_config.json \
+  -O aicc:vertical_config:/path/to/vertical_config.json \
+  myfile.nc
+```

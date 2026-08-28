@@ -72,6 +72,7 @@ known-first-party = ["cc_plugin_aicc"]
 lines-after-imports = 1
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 filterwarnings = [
   "ignore::UserWarning",
   "ignore::RuntimeWarning"
