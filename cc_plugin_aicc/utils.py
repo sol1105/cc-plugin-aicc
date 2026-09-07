@@ -114,7 +114,9 @@ def _as_list(val) -> list:
 
 def _is_scalar_coord(ce: dict) -> bool:
     """True if the coordinate table entry prescribes a scalar value or bounds."""
-    return bool(ce.get("value") or ce.get("bounds_values"))
+    return ce.get("coordinate_type") == "scalar" or bool(
+        ce.get("value") or ce.get("bounds_values")
+    )
 
 
 def _decode_char_var(var) -> list:
@@ -138,13 +140,46 @@ def _parse_formula_terms(ft_str: str) -> dict:
     return {m.group(1): m.group(2) for m in re.finditer(r"(\w+)\s*:\s*(\w+)", ft_str)}
 
 
-def _find_formula_entry(formula_entries: dict, var_name: str, generic_id: str) -> dict:
-    """Return the formula_terms table entry whose out_name and dimension match."""
-    for entry in formula_entries.values():
-        if (entry.get("out_name") == var_name
-                and generic_id in entry.get("dimensions", "")):
-            return entry
-    return {}
+def _dimension_ids(entry: dict) -> list[str]:
+    """Return a descriptor's ordered coordinate IDs in either source format."""
+    dimensions = entry.get("dimensions") or []
+    if isinstance(dimensions, str):
+        return dimensions.split()
+    result = []
+    for dimension in dimensions:
+        if isinstance(dimension, str):
+            result.append(dimension)
+        elif isinstance(dimension, dict) and dimension.get("id"):
+            result.append(str(dimension["id"]))
+        elif getattr(dimension, "id", None):
+            result.append(str(dimension.id))
+    return result
+
+
+def _find_formula_entry(
+    formula_entries: dict,
+    var_name: str,
+    generic_id: str,
+    requested_dims=(),
+) -> dict:
+    """Select the formula-term entry appropriate to this branded variable."""
+    candidates = [
+        entry for entry in formula_entries.values() if entry.get("out_name") == var_name
+    ]
+    if not candidates:
+        return {}
+    generic_matches = [
+        entry for entry in candidates if generic_id in _dimension_ids(entry)
+    ]
+    if generic_matches:
+        return generic_matches[0]
+    requested = set(requested_dims or [])
+    compatible = [
+        entry
+        for entry in candidates
+        if all(identifier in requested for identifier in _dimension_ids(entry))
+    ]
+    return compatible[0] if compatible else candidates[0]
 
 
 def _cmor_tol_val(i: int, req_vals: list, bound_pairs: list, tolerance: float) -> float:

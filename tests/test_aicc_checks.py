@@ -28,6 +28,7 @@ TIME_ENTRY = {
 
 HYBRID_ENTRY = {
     "out_name": "lev",
+    "generic_level_name": "alevel",
     "standard_name": "atmosphere_hybrid_sigma_pressure_coordinate",
     "stored_direction": "decreasing",
     "positive": "down",
@@ -123,42 +124,68 @@ CURVILINEAR_GRID_ENTRIES = {
 
 CURVILINEAR_AXIS_ENTRIES = {
     "grid_latitude": {
-        "axis": "Y", "out_name": "rlat", "standard_name": "grid_latitude",
-        "long_name": "latitude in rotated pole grid", "units": "degrees",
+        "axis": "Y",
+        "out_name": "rlat",
+        "standard_name": "grid_latitude",
+        "long_name": "latitude in rotated pole grid",
+        "units": "degrees",
         "type": "double",
     },
     "grid_longitude": {
-        "axis": "X", "out_name": "rlon", "standard_name": "grid_longitude",
-        "long_name": "longitude in rotated pole grid", "units": "degrees",
+        "axis": "X",
+        "out_name": "rlon",
+        "standard_name": "grid_longitude",
+        "long_name": "longitude in rotated pole grid",
+        "units": "degrees",
         "type": "double",
     },
     "x": {
-        "axis": "X", "out_name": "", "standard_name": "projection_x_coordinate",
-        "long_name": "x coordinate of projection", "units": "m", "type": "double",
+        "axis": "X",
+        "out_name": "",
+        "standard_name": "projection_x_coordinate",
+        "long_name": "x coordinate of projection",
+        "units": "m",
+        "type": "double",
     },
     "y": {
-        "axis": "Y", "out_name": "", "standard_name": "projection_y_coordinate",
-        "long_name": "y coordinate of projection", "units": "m", "type": "double",
+        "axis": "Y",
+        "out_name": "",
+        "standard_name": "projection_y_coordinate",
+        "long_name": "y coordinate of projection",
+        "units": "m",
+        "type": "double",
     },
     "x_deg": {
-        "axis": "X", "out_name": "x",
+        "axis": "X",
+        "out_name": "x",
         "standard_name": "projection_x_angular_coordinate",
-        "long_name": "x angular coordinate of projection", "units": "degrees",
+        "long_name": "x angular coordinate of projection",
+        "units": "degrees",
         "type": "double",
     },
     "y_deg": {
-        "axis": "Y", "out_name": "y",
+        "axis": "Y",
+        "out_name": "y",
         "standard_name": "projection_y_angular_coordinate",
-        "long_name": "y angular coordinate of projection", "units": "degrees",
+        "long_name": "y angular coordinate of projection",
+        "units": "degrees",
         "type": "double",
     },
     "i_index": {
-        "axis": "", "out_name": "i", "standard_name": "",
-        "long_name": "first spatial index", "units": "1", "type": "integer",
+        "axis": "",
+        "out_name": "i",
+        "standard_name": "",
+        "long_name": "first spatial index",
+        "units": "1",
+        "type": "integer",
     },
     "j_index": {
-        "axis": "", "out_name": "j", "standard_name": "",
-        "long_name": "second spatial index", "units": "1", "type": "integer",
+        "axis": "",
+        "out_name": "j",
+        "standard_name": "",
+        "long_name": "second spatial index",
+        "units": "1",
+        "type": "integer",
     },
 }
 
@@ -294,7 +321,10 @@ def test_time4_uses_table_climatology_and_rejects_regular_bounds(tmp_path):
 
     messages = _messages(results, BaseCheck.HIGH)
     assert any("must not have a 'bounds' attribute" in message for message in messages)
-    assert any("must not define regular bounds variable 'time_bnds'" in message for message in messages)
+    assert any(
+        "must not define regular bounds variable 'time_bnds'" in message
+        for message in messages
+    )
 
 
 def test_climatology_may_name_time_bnds_itself(tmp_path):
@@ -310,6 +340,46 @@ def test_climatology_may_name_time_bnds_itself(tmp_path):
     assert not any(
         "must not define regular bounds variable" in message
         for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_time_bounds_follow_declared_nonstandard_name(tmp_path):
+    entry = {
+        **TIME_ENTRY,
+        "must_have_bounds": "yes",
+        "stored_direction": "increasing",
+    }
+    dataset = xr.Dataset(
+        data_vars={
+            "custom_time_bounds": (
+                ("time", "nv"),
+                [[0.0, 30.0], [30.0, 60.0]],
+            )
+        },
+        coords={"time": ("time", [15.0, 45.0])},
+    )
+    dataset["time"].attrs.update(
+        {
+            "axis": "T",
+            "standard_name": "time",
+            "long_name": "Time Intervals",
+            "units": "days since 2000-01-01",
+            "calendar": "proleptic_gregorian",
+            "bounds": "custom_time_bounds",
+        }
+    )
+    checker = _checker(["time1"], {"time1": entry})
+
+    with _open_netcdf(tmp_path, "time_custom_bounds", dataset) as nc:
+        results = checker.check_time(nc)
+
+    high = _messages(results, BaseCheck.HIGH)
+    assert not any(
+        "custom_time_bounds" in message and "not found" in message for message in high
+    )
+    assert any(
+        "recommended name is 'time_bnds'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
     )
 
 
@@ -331,6 +401,7 @@ def _hybrid_dataset(b_values, *, formula_terms="ap: ap b: b ps: ps"):
             "axis": "Z",
             "standard_name": "atmosphere_hybrid_sigma_pressure_coordinate",
             "positive": "down",
+            "formula": HYBRID_ENTRY["formula"],
         }
     )
     if formula_terms is not None:
@@ -387,10 +458,35 @@ def test_vertical_bounds_follow_stored_direction(tmp_path):
     )
 
 
+def test_vertical_bounds_follow_declared_nonstandard_name(tmp_path):
+    entry = {**HYBRID_ENTRY, "must_have_bounds": "yes"}
+    dataset = _hybrid_dataset([1.0, 0.5, 0.0])
+    dataset["custom_level_bounds"] = (
+        ("lev", "nv"),
+        [[1.1, 0.9], [0.6, 0.4], [0.1, -0.1]],
+    )
+    dataset["lev"].attrs["bounds"] = "custom_level_bounds"
+    checker = _checker(
+        ["alevel"],
+        {"hybrid": entry},
+        vert_mapping={"alevel": "hybrid"},
+    )
+
+    with _open_netcdf(tmp_path, "vertical_custom_bounds", dataset) as nc:
+        results = checker.check_vertical(nc)
+
+    high = _messages(results, BaseCheck.HIGH)
+    assert not any(
+        "custom_level_bounds" in message and "not found" in message for message in high
+    )
+    assert any(
+        "recommended name is 'lev_bnds'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
+    )
+
+
 @pytest.mark.parametrize("file_standard_name", [None, "height"])
-def test_vertical_direction_uses_the_table_standard_name(
-    tmp_path, file_standard_name
-):
+def test_vertical_direction_uses_the_table_standard_name(tmp_path, file_standard_name):
     dataset = _hybrid_dataset([1.0, 0.5, 0.0])
     dataset["lev"].attrs["positive"] = "up"
     if file_standard_name is None:
@@ -456,6 +552,55 @@ def test_vertical_coordinate_reports_divergent_formula_terms(tmp_path):
     )
 
 
+@pytest.mark.parametrize("formula", [None, "p = a*p0 + b*ps"])
+def test_vertical_coordinate_requires_the_table_formula(tmp_path, formula):
+    dataset = _hybrid_dataset([1.0, 0.5, 0.0])
+    if formula is None:
+        del dataset["lev"].attrs["formula"]
+    else:
+        dataset["lev"].attrs["formula"] = formula
+
+    with _open_netcdf(tmp_path, "hybrid_formula", dataset) as nc:
+        results = _vertical_checker().check_vertical(nc)
+
+    assert any(
+        "formula=" in message and "expected 'p = ap + b*ps'" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_vertical_mapping_uses_table_generic_level_marker_only(tmp_path):
+    dataset = _hybrid_dataset([1.0, 0.5, 0.0])
+    assert "generic_level_name" not in dataset["lev"].attrs
+    wrong_entry = {**HYBRID_ENTRY, "generic_level_name": "olevel"}
+    checker = _checker(
+        ["alevel"],
+        {"hybrid": wrong_entry},
+        vert_mapping={"alevel": "hybrid"},
+    )
+
+    with _open_netcdf(tmp_path, "hybrid_generic_marker", dataset) as nc:
+        results = checker.check_vertical(nc)
+
+    assert any(
+        "generic_level_name='olevel'; expected 'alevel'" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_generic_level_name_is_not_required_in_file_metadata(tmp_path):
+    dataset = _hybrid_dataset([1.0, 0.5, 0.0])
+    assert "generic_level_name" not in dataset["lev"].attrs
+
+    with _open_netcdf(tmp_path, "hybrid_without_generic_attribute", dataset) as nc:
+        results = _vertical_checker().check_vertical(nc)
+
+    assert not any(
+        "generic_level_name" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
 def _coordinate_dataset(name, values, standard_name, *, positive=None, dims=None):
     dimensions = dims or (name,)
     dataset = xr.Dataset({name: (dimensions, np.asarray(values, dtype="float64"))})
@@ -508,12 +653,8 @@ def test_coordinate_reports_an_incorrect_storage_type(tmp_path):
 def test_coordinate_positive_is_checked_against_table_and_physical_meaning(
     tmp_path,
 ):
-    dataset = xr.Dataset(
-        coords={"plev": ("plev", [100000.0, 50000.0, 10000.0])}
-    )
-    dataset["plev"].attrs.update(
-        {"standard_name": "air_pressure", "positive": "up"}
-    )
+    dataset = xr.Dataset(coords={"plev": ("plev", [100000.0, 50000.0, 10000.0])})
+    dataset["plev"].attrs.update({"standard_name": "air_pressure", "positive": "up"})
     checker = _checker(["plev19"], {"plev19": PLEV_ENTRY})
 
     with _open_netcdf(tmp_path, "plev_positive_up", dataset) as nc:
@@ -584,9 +725,7 @@ def test_stored_direction_applies_without_physical_positive_semantics(tmp_path):
 
 def test_numeric_coordinate_must_be_named_and_dimensioned_as_itself(tmp_path):
     dataset = xr.Dataset({"depth": (("level",), [0.0, 10.0])})
-    dataset["depth"].attrs.update(
-        {"standard_name": "depth", "positive": "down"}
-    )
+    dataset["depth"].attrs.update({"standard_name": "depth", "positive": "down"})
     checker = _checker(["sdepth"], {"sdepth": DEPTH_ENTRY})
 
     with _open_netcdf(tmp_path, "depth_wrong_dimension", dataset) as nc:
@@ -618,7 +757,10 @@ def test_ordinary_axis_and_scalar_units_are_required(tmp_path):
 
     messages = _messages(results, BaseCheck.HIGH)
     assert any("axis='X'; expected 'Z'" in message for message in messages)
-    assert any("units" in message and "required table units 'm'" in message for message in messages)
+    assert any(
+        "units" in message and "required table units 'm'" in message
+        for message in messages
+    )
 
 
 def test_long_name_is_required_without_standard_name_and_mismatch_is_medium(tmp_path):
@@ -681,7 +823,13 @@ def test_unprescribed_attributes_warn_and_optional_bounds_are_allowed(tmp_path):
     assert any("does not prescribe an axis" in message for message in warnings)
     assert any("does not prescribe units" in message for message in warnings)
     assert any("does not prescribe positive" in message for message in warnings)
-    assert not any("bounds" in message.lower() for message in _messages(results))
+    assert not any(
+        "bounds" in message.lower() for message in _messages(results, BaseCheck.HIGH)
+    )
+    assert any(
+        "recommended name is 'bnds'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
+    )
 
 
 @pytest.mark.parametrize(
@@ -728,8 +876,67 @@ def test_bounds_structure_type_direction_and_naming(tmp_path):
         results = checker.check_coord(nc)
 
     high = _messages(results, BaseCheck.HIGH)
+    assert not any(
+        "custom_bounds" in message and "not found" in message for message in high
+    )
     assert any("expected CMOR type 'double'" in message for message in high)
     assert any("not ordered lower-to-upper" in message for message in high)
+    assert any(
+        "recommended name is 'depth_bnds'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
+    )
+
+
+def test_optional_bounds_attribute_is_followed(tmp_path):
+    entry = {**DEPTH_ENTRY, "must_have_bounds": "no"}
+    dataset = xr.Dataset(coords={"depth": ("depth", [0.5, 10.0])})
+    dataset["depth"].attrs.update(
+        {
+            "standard_name": "depth",
+            "positive": "down",
+            "bounds": "provided_but_missing",
+        }
+    )
+    checker = _checker(["sdepth"], {"sdepth": entry})
+
+    with _open_netcdf(tmp_path, "optional_dangling_bounds", dataset) as nc:
+        results = checker.check_coord(nc)
+
+    assert any(
+        "Bounds variable 'provided_but_missing'" in message and "not found" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_scalar_bounds_follow_declared_nonstandard_name(tmp_path):
+    entry = {
+        **DEPTH_ENTRY,
+        "value": "2",
+        "bounds_values": "1 3",
+        "must_have_bounds": "yes",
+    }
+    dataset = xr.Dataset(
+        data_vars={
+            "depth": xr.DataArray(2.0),
+            "custom_scalar_bounds": (("nv",), [1.0, 3.0]),
+        }
+    )
+    dataset["depth"].attrs.update(
+        {
+            "standard_name": "depth",
+            "positive": "down",
+            "bounds": "custom_scalar_bounds",
+        }
+    )
+    checker = _checker(["depth2"], {"depth2": entry})
+
+    with _open_netcdf(tmp_path, "scalar_custom_bounds", dataset) as nc:
+        results = checker.check_coord(nc)
+
+    high = _messages(results, BaseCheck.HIGH)
+    assert not any(
+        "custom_scalar_bounds" in message and "not found" in message for message in high
+    )
     assert any(
         "recommended name is 'depth_bnds'" in message
         for message in _messages(results, BaseCheck.MEDIUM)
@@ -805,7 +1012,9 @@ def _character_sector_dataset(coordinates=""):
     return dataset
 
 
-def test_text_auxiliary_coordinate_must_be_listed_but_extra_labels_are_allowed(tmp_path):
+def test_text_auxiliary_coordinate_must_be_listed_but_extra_labels_are_allowed(
+    tmp_path,
+):
     entry = {
         "out_name": "basin",
         "standard_name": "",
@@ -828,13 +1037,18 @@ def test_text_auxiliary_coordinate_must_be_listed_but_extra_labels_are_allowed(t
     listed["sector"].attrs["long_name"] = "Basin"
     with _open_netcdf(tmp_path, "sector_listed", listed) as nc:
         results = checker.check_coord(nc)
-    assert not any("missing requested value" in message for message in _messages(results))
+    assert not any(
+        "missing requested value" in message for message in _messages(results)
+    )
 
 
 def test_site_requires_latitude_and_longitude_auxiliaries(tmp_path):
     entry = {
-        "out_name": "site", "standard_name": "", "long_name": "site index",
-        "type": "integer", "requested": ["1", "2"],
+        "out_name": "site",
+        "standard_name": "",
+        "long_name": "site index",
+        "type": "integer",
+        "requested": ["1", "2"],
     }
     dataset = xr.Dataset(
         data_vars={"tas": (("site",), [280.0, 281.0])},
@@ -872,9 +1086,7 @@ def test_site_requires_latitude_and_longitude_auxiliaries(tmp_path):
 def test_cmor_tolerance_algorithms_follow_coordinate_recipe():
     assert _cmor_tol_val(0, [100.0, 110.0], [], 1.0) == pytest.approx(0.1)
     assert _cmor_tol_val(1, [100.0, 110.0], [], 1.0) == pytest.approx(0.11)
-    assert _cmor_bound_tol_vals(0, [(100.0, 200.0)], 1.0) == pytest.approx(
-        (0.1, 0.2)
-    )
+    assert _cmor_bound_tol_vals(0, [(100.0, 200.0)], 1.0) == pytest.approx((0.1, 0.2))
 
 
 def _horizontal_dataset(coordinates="latitude longitude"):
@@ -899,6 +1111,78 @@ def _horizontal_dataset(coordinates="latitude longitude"):
     )
     dataset["ta"].attrs["coordinates"] = coordinates
     return dataset
+
+
+def test_rectilinear_bounds_name_uses_cmor_coordinate_name(tmp_path):
+    latitude_entry = {
+        "out_name": "lat",
+        "standard_name": "latitude",
+        "axis": "Y",
+        "units": "degrees_north",
+        "type": "double",
+        "must_have_bounds": "yes",
+    }
+    dataset = _horizontal_dataset()
+    dataset["latitude_bnds"] = (
+        ("latitude", "nv"),
+        [[-90.0, 0.0], [0.0, 90.0]],
+    )
+    dataset["latitude"].attrs["bounds"] = "latitude_bnds"
+    checker = _checker(
+        ["latitude"],
+        {"latitude": latitude_entry},
+        var_entry={"out_name": "ta"},
+    )
+    checker._grid_type = "rectilinear"
+    checker._grid_type_known = True
+
+    with _open_netcdf(tmp_path, "rectilinear_bounds_name", dataset) as nc:
+        results = checker.check_grid(nc)
+
+    assert not any(
+        "latitude_bnds" in message and "not found" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+    assert any(
+        "'latitude' bounds='latitude_bnds'; recommended name is 'lat_bnds'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
+    )
+
+
+def test_existing_longitude_bounds_is_not_reported_as_missing(tmp_path):
+    longitude_entry = {
+        "out_name": "lon",
+        "standard_name": "longitude",
+        "axis": "X",
+        "units": "degrees_east",
+        "type": "double",
+        "must_have_bounds": "yes",
+    }
+    dataset = _horizontal_dataset()
+    dataset["longitude_bnds"] = (
+        ("longitude", "nv"),
+        [[-60.0, 60.0], [60.0, 180.0], [180.0, 300.0]],
+    )
+    dataset["longitude"].attrs["bounds"] = "longitude_bnds"
+    checker = _checker(
+        ["longitude"],
+        {"longitude": longitude_entry},
+        var_entry={"out_name": "ta"},
+    )
+    checker._grid_type = "rectilinear"
+    checker._grid_type_known = True
+
+    with _open_netcdf(tmp_path, "longitude_declared_bounds", dataset) as nc:
+        results = checker.check_grid(nc)
+
+    high = _messages(results, BaseCheck.HIGH)
+    assert not any(
+        "longitude_bnds" in message and "not found" in message for message in high
+    )
+    assert any(
+        "'longitude' bounds='longitude_bnds'; recommended name is 'lon_bnds'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
+    )
 
 
 def _unknown_grid_checker():
@@ -949,7 +1233,11 @@ def _curvilinear_dataset(axis_scheme):
         dims = ("rlat", "rlon")
         axis_coords = {
             "rlat": ("rlat", [-1.0, 1.0], CURVILINEAR_AXIS_ENTRIES["grid_latitude"]),
-            "rlon": ("rlon", [-2.0, 0.0, 2.0], CURVILINEAR_AXIS_ENTRIES["grid_longitude"]),
+            "rlon": (
+                "rlon",
+                [-2.0, 0.0, 2.0],
+                CURVILINEAR_AXIS_ENTRIES["grid_longitude"],
+            ),
         }
     elif axis_scheme == "metric":
         dims = ("y", "x")
@@ -966,8 +1254,16 @@ def _curvilinear_dataset(axis_scheme):
     elif axis_scheme == "index":
         dims = ("j", "i")
         axis_coords = {
-            "j": ("j", np.asarray([0, 1], dtype="int32"), CURVILINEAR_AXIS_ENTRIES["j_index"]),
-            "i": ("i", np.asarray([0, 1, 2], dtype="int32"), CURVILINEAR_AXIS_ENTRIES["i_index"]),
+            "j": (
+                "j",
+                np.asarray([0, 1], dtype="int32"),
+                CURVILINEAR_AXIS_ENTRIES["j_index"],
+            ),
+            "i": (
+                "i",
+                np.asarray([0, 1, 2], dtype="int32"),
+                CURVILINEAR_AXIS_ENTRIES["i_index"],
+            ),
         }
     else:
         dims = ("y", "x")
@@ -980,10 +1276,12 @@ def _curvilinear_dataset(axis_scheme):
         data_vars={
             "tas": (dims, np.zeros((2, 3), dtype="float32")),
             "vertices_latitude": (
-                (*dims, "vertices"), latitude[..., None] + vertex_offsets,
+                (*dims, "vertices"),
+                latitude[..., None] + vertex_offsets,
             ),
             "vertices_longitude": (
-                (*dims, "vertices"), longitude[..., None] + vertex_offsets,
+                (*dims, "vertices"),
+                longitude[..., None] + vertex_offsets,
             ),
         },
         coords={
@@ -994,10 +1292,14 @@ def _curvilinear_dataset(axis_scheme):
     )
     for name in ("latitude", "longitude", "vertices_latitude", "vertices_longitude"):
         dataset[name].attrs.update(CURVILINEAR_GRID_ENTRIES[name])
+    dataset["latitude"].attrs["bounds"] = "vertices_latitude"
+    dataset["longitude"].attrs["bounds"] = "vertices_longitude"
     dataset["tas"].attrs["coordinates"] = "latitude longitude"
     if axis_scheme == "rotated":
         dataset["rotated_pole"] = xr.DataArray(0)
-        dataset["rotated_pole"].attrs["grid_mapping_name"] = "rotated_latitude_longitude"
+        dataset["rotated_pole"].attrs["grid_mapping_name"] = (
+            "rotated_latitude_longitude"
+        )
         dataset["tas"].attrs["grid_mapping"] = "rotated_pole"
     elif axis_scheme in {"metric", "angular"}:
         dataset["projection"] = xr.DataArray(0)
@@ -1021,7 +1323,9 @@ def _curvilinear_checker():
     return checker
 
 
-@pytest.mark.parametrize("axis_scheme", ["implicit", "rotated", "metric", "angular", "index"])
+@pytest.mark.parametrize(
+    "axis_scheme", ["implicit", "rotated", "metric", "angular", "index"]
+)
 def test_curvilinear_grid_accepts_supported_axis_representations(tmp_path, axis_scheme):
     dataset = _curvilinear_dataset(axis_scheme)
     checker = _curvilinear_checker()
@@ -1054,6 +1358,79 @@ def test_curvilinear_grid_rejects_invalid_vertex_dimensions(tmp_path):
     )
 
 
+def test_curvilinear_vertices_follow_declared_bounds_name(tmp_path):
+    dataset = _curvilinear_dataset("implicit").rename(
+        {"vertices_longitude": "custom_longitude_vertices"}
+    )
+    dataset["longitude"].attrs["bounds"] = "custom_longitude_vertices"
+
+    with _open_netcdf(tmp_path, "curvilinear_custom_vertices", dataset) as nc:
+        results = _curvilinear_checker().check_grid(nc)
+
+    high = _messages(results, BaseCheck.HIGH)
+    assert not any(
+        "custom_longitude_vertices" in message and "not found" in message
+        for message in high
+    )
+    assert any(
+        "bounds='custom_longitude_vertices'; recommended name is "
+        "'vertices_longitude'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
+    )
+
+
+def test_curvilinear_grid_requires_both_horizontal_coordinates(tmp_path):
+    dataset = _curvilinear_dataset("implicit").drop_vars(
+        ["longitude", "vertices_longitude"]
+    )
+
+    with _open_netcdf(tmp_path, "curvilinear_missing_longitude", dataset) as nc:
+        results = _curvilinear_checker().check_grid(nc)
+
+    assert any(
+        "Curvilinear longitude variable 'longitude' not found" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_curvilinear_latitude_and_longitude_must_share_dimensions(tmp_path):
+    dataset = _curvilinear_dataset("implicit").drop_vars(
+        ["longitude", "vertices_longitude"]
+    )
+    longitude = np.asarray([[10.0, 11.0, 12.0], [10.5, 11.5, 12.5]])
+    offsets = np.asarray([-0.2, -0.1, 0.1, 0.2])
+    dataset = dataset.assign_coords(longitude=(("y", "x2"), longitude))
+    dataset["longitude"].attrs.update(CURVILINEAR_GRID_ENTRIES["longitude"])
+    dataset["vertices_longitude"] = (
+        ("y", "x2", "vertices"),
+        longitude[..., None] + offsets,
+    )
+    dataset["vertices_longitude"].attrs.update(
+        CURVILINEAR_GRID_ENTRIES["vertices_longitude"]
+    )
+
+    with _open_netcdf(tmp_path, "curvilinear_mismatched_dims", dataset) as nc:
+        results = _curvilinear_checker().check_grid(nc)
+
+    assert any(
+        "latitude and longitude must share the same two dimensions" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_rotated_mapping_requires_rotated_coordinate_axes(tmp_path):
+    dataset = _curvilinear_dataset("metric")
+    dataset["projection"].attrs["grid_mapping_name"] = "rotated_latitude_longitude"
+
+    with _open_netcdf(tmp_path, "curvilinear_wrong_mapping_axes", dataset) as nc:
+        results = _curvilinear_checker().check_grid(nc)
+
+    assert any(
+        "requires the rlat/rlon axis representation" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
 def _unstructured_latitude_dataset(vertex_units=None):
     dataset = xr.Dataset(
         data_vars={
@@ -1072,6 +1449,7 @@ def _unstructured_latitude_dataset(vertex_units=None):
             "units": "degrees_north",
         }
     )
+    dataset["latitude"].attrs["bounds"] = "vertices_latitude"
     dataset["tas"].attrs["coordinates"] = "latitude"
     if vertex_units is not None:
         dataset["vertices_latitude"].attrs["units"] = vertex_units
@@ -1098,8 +1476,11 @@ def test_vertex_bounds_attributes_are_optional(tmp_path, vertex_units):
         results = _unstructured_grid_checker().check_grid(nc)
 
     assert not any(
-        "vertices_latitude" in message
-        for message in _messages(results, BaseCheck.HIGH)
+        "vertices_latitude" in message for message in _messages(results, BaseCheck.HIGH)
+    )
+    assert any(
+        "trailing dimension 'vertex'; recommended name is 'vertices'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
     )
 
 
@@ -1113,3 +1494,266 @@ def test_vertex_bounds_reports_an_incorrect_attribute(tmp_path):
         "'vertices_latitude' units:" in message
         for message in _messages(results, BaseCheck.HIGH)
     )
+
+
+def test_unstructured_vertices_follow_declared_bounds_name(tmp_path):
+    dataset = _unstructured_latitude_dataset().rename(
+        {"vertices_latitude": "custom_latitude_vertices"}
+    )
+    dataset["latitude"].attrs["bounds"] = "custom_latitude_vertices"
+
+    with _open_netcdf(tmp_path, "unstructured_custom_vertices", dataset) as nc:
+        results = _unstructured_grid_checker().check_grid(nc)
+
+    high = _messages(results, BaseCheck.HIGH)
+    assert not any(
+        "custom_latitude_vertices" in message and "not found" in message
+        for message in high
+    )
+    assert any(
+        "bounds='custom_latitude_vertices'; recommended name is "
+        "'vertices_latitude'" in message
+        for message in _messages(results, BaseCheck.MEDIUM)
+    )
+
+
+def test_numeric_coordinate_without_stored_direction_must_be_strictly_monotonic(
+    tmp_path,
+):
+    entry = {**RHO_ENTRY, "stored_direction": ""}
+    dataset = xr.Dataset(coords={"rho": ("rho", [1.0, 3.0, 2.0])})
+    dataset["rho"].attrs["standard_name"] = entry["standard_name"]
+
+    with _open_netcdf(tmp_path, "rho_not_monotonic", dataset) as nc:
+        results = _checker(["rho"], {"rho": entry}).check_coordinate_direction(nc)
+
+    assert any(
+        "not strictly monotonic (increasing or decreasing)" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_bounds_infer_parent_direction_and_check_inside_and_between_pairs(tmp_path):
+    entry = {**RHO_ENTRY, "stored_direction": "", "must_have_bounds": "yes"}
+    dataset = xr.Dataset(
+        data_vars={
+            "rho_bnds": (
+                ("rho", "bnds"),
+                [[0.5, 1.5], [2.5, 1.8], [1.0, 3.5]],
+            )
+        },
+        coords={"rho": ("rho", [1.0, 2.0, 3.0])},
+    )
+    dataset["rho"].attrs.update(
+        {"standard_name": entry["standard_name"], "bounds": "rho_bnds"}
+    )
+
+    with _open_netcdf(tmp_path, "inferred_bounds_direction", dataset) as nc:
+        results = _checker(["rho"], {"rho": entry}).check_coord(nc)
+
+    messages = _messages(results, BaseCheck.HIGH)
+    assert any("not ordered lower-to-upper" in message for message in messages)
+    assert any("between successive cells" in message for message in messages)
+    assert all(
+        "parent coordinate 'rho'" in message
+        for message in messages
+        if "ordered" in message or "successive" in message
+    )
+
+
+def test_dimension_order_uses_generic_vertical_out_name(tmp_path):
+    generic = {"out_name": "model_lev", "type": "double"}
+    configured = {
+        **HYBRID_ENTRY,
+        "out_name": "model_lev",
+        "generic_level_name": "alevel",
+    }
+    dataset = xr.Dataset(
+        data_vars={"ta": (("model_lev",), [250.0, 240.0])},
+        coords={"model_lev": ("model_lev", [1.0, 0.0])},
+    )
+    checker = _checker(
+        ["alevel"],
+        {"alevel": generic, "configured": configured},
+        var_entry={"out_name": "ta"},
+        vert_mapping={"alevel": "configured"},
+    )
+
+    with _open_netcdf(tmp_path, "generic_vertical_out_name", dataset) as nc:
+        results = checker.check_dimensions(nc)
+
+    assert _messages(results, BaseCheck.HIGH) == []
+
+
+def test_formula_term_dimensions_are_validated(tmp_path):
+    dataset = _hybrid_dataset([1.0, 0.5, 0.0]).drop_vars("ap")
+    dataset["ap"] = (("wrong_level",), [0.0, 0.0, 0.0])
+    checker = _vertical_checker()
+    checker.CTformulas = {
+        "formula_entry": {
+            "ap": {
+                "out_name": "ap",
+                "dimensions": "alevel",
+                "type": "double",
+                "units": "",
+            }
+        }
+    }
+
+    with _open_netcdf(tmp_path, "formula_term_dimensions", dataset) as nc:
+        results = checker.check_vertical(nc)
+
+    assert any(
+        "Formula term 'ap' has dimensions ['wrong_level']; expected ['lev']" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_bounds_formula_terms_and_factor_dimensions_are_validated(tmp_path):
+    entry = {
+        **HYBRID_ENTRY,
+        "must_have_bounds": "yes",
+        "z_bounds_factors": "ap: ap_bnds b: b_bnds ps: ps",
+    }
+    dataset = _hybrid_dataset([1.0, 0.5, 0.0])
+    dataset["lev_bnds"] = (
+        ("lev", "bnds"),
+        [[1.1, 0.9], [0.6, 0.4], [0.1, -0.1]],
+    )
+    dataset["lev"].attrs["bounds"] = "lev_bnds"
+    dataset["lev_bnds"].attrs["formula_terms"] = "ap: wrong b: b_bnds ps: ps"
+    dataset["ap_bnds"] = (("wrong_level", "bnds"), np.zeros((3, 2)))
+    dataset["b_bnds"] = (("lev", "bnds"), np.zeros((3, 2)))
+    checker = _checker(
+        ["alevel"],
+        {"hybrid": entry},
+        vert_mapping={"alevel": "hybrid"},
+    )
+    checker.CTformulas = {
+        "formula_entry": {
+            "ap_bnds": {
+                "out_name": "ap_bnds",
+                "dimensions": "alevel",
+                "type": "double",
+                "units": "Pa",
+            },
+            "b_bnds": {
+                "out_name": "b_bnds",
+                "dimensions": "alevel",
+                "type": "double",
+                "units": "",
+            },
+        }
+    }
+
+    with _open_netcdf(tmp_path, "bounds_formula_terms", dataset) as nc:
+        results = checker.check_vertical(nc)
+
+    messages = _messages(results, BaseCheck.HIGH)
+    assert any("'lev_bnds' formula_terms=" in message for message in messages)
+    assert any(
+        "Bounds formula term 'ap_bnds'" in message
+        and "size-2 bounds dimension" in message
+        for message in messages
+    ), messages
+
+
+def test_model_level_bounds_formula_must_match_parent(tmp_path):
+    entry = {**HYBRID_ENTRY, "must_have_bounds": "yes"}
+    dataset = _hybrid_dataset([1.0, 0.5, 0.0])
+    dataset["lev_bnds"] = (
+        ("lev", "bnds"),
+        [[1.1, 0.9], [0.6, 0.4], [0.1, -0.1]],
+    )
+    dataset["lev"].attrs["bounds"] = "lev_bnds"
+    dataset["lev_bnds"].attrs["formula"] = "p = a*p0 + b*ps"
+    checker = _checker(
+        ["alevel"],
+        {"hybrid": entry},
+        vert_mapping={"alevel": "hybrid"},
+    )
+
+    with _open_netcdf(tmp_path, "bounds_formula", dataset) as nc:
+        results = checker.check_vertical(nc)
+
+    assert any(
+        "expected the same formula as 'lev': 'p = ap + b*ps'" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_unstructured_vertices_follow_auxiliary_dimension(tmp_path):
+    dataset = _unstructured_latitude_dataset()
+    dataset["vertices_latitude"] = (
+        ("other_cell", "vertices"),
+        [[-50.0, -45.0, -40.0], [40.0, 45.0, 50.0]],
+    )
+
+    with _open_netcdf(tmp_path, "unstructured_vertex_dimensions", dataset) as nc:
+        results = _unstructured_grid_checker().check_grid(nc)
+
+    assert any(
+        "must use the auxiliary coordinate dimension" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_explicit_grid_axes_must_be_strictly_monotonic(tmp_path):
+    dataset = _curvilinear_dataset("rotated")
+    dataset = dataset.assign_coords(
+        rlat=(
+            "rlat",
+            [0.0, 0.0],
+            CURVILINEAR_AXIS_ENTRIES["grid_latitude"],
+        )
+    )
+
+    with _open_netcdf(tmp_path, "nonmonotonic_grid_axis", dataset) as nc:
+        results = _curvilinear_checker().check_grid(nc)
+
+    assert any(
+        "Grid axis 'rlat' is not strictly monotonic" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_explicit_unstructured_axis_is_validated(tmp_path):
+    dataset = _unstructured_latitude_dataset().assign_coords(
+        cell=(
+            "cell",
+            [0, 0],
+            {"long_name": "cell index", "units": "1"},
+        )
+    )
+    checker = _unstructured_grid_checker()
+    checker.CTgrids["axis_entry"] = {
+        "cell_index": {
+            "out_name": "cell",
+            "long_name": "cell index",
+            "units": "1",
+            "type": "integer",
+        }
+    }
+
+    with _open_netcdf(tmp_path, "nonmonotonic_cell_axis", dataset) as nc:
+        results = checker.check_grid(nc)
+
+    assert any(
+        "Grid axis 'cell' is not strictly monotonic" in message
+        for message in _messages(results, BaseCheck.HIGH)
+    )
+
+
+def test_climatology_and_bounds_dimension_names_are_recommended(tmp_path):
+    entry = {**TIME_ENTRY, "must_have_bounds": "yes", "climatology": "yes"}
+    dataset = _climatology_dataset()
+    checker = _checker(["time4"], {"time4": entry})
+
+    with _open_netcdf(tmp_path, "climatology_names", dataset) as nc:
+        results = checker.check_time(nc)
+
+    messages = _messages(results, BaseCheck.MEDIUM)
+    assert any(
+        "recommended name is 'climatology_bnds'" in message for message in messages
+    )
+    assert any("recommended name is 'bnds'" in message for message in messages)
