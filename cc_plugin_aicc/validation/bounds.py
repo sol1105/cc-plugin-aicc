@@ -137,7 +137,7 @@ def _check_bounds_structure(
     *,
     scalar: bool = False,
 ):
-    """Check bounds dimensions, size-two axis, storage type, and direction."""
+    """Check bounds dimensions, size-two axis, and storage type."""
     if scalar:
         valid_shape = bnds_var.ndim == 1 and bnds_var.shape == (2,)
         expected = "one size-2 dimension"
@@ -164,13 +164,4 @@ def _check_bounds_structure(
         bnds_name,
         "bnds",
         description="Bounds variable",
-    )
-    _check_bounds_direction(
-        ctx,
-        coord_var,
-        getattr(coord_var, "name", "coordinate"),
-        bnds_var,
-        bnds_name,
-        ce.get("stored_direction", ""),
-        scalar=scalar,
     )

@@ -441,7 +441,7 @@ def test_vertical_direction_reports_a_reversed_formula_profile(tmp_path):
     )
 
 
-def test_vertical_bounds_follow_stored_direction(tmp_path):
+def test_vertical_bounds_direction_is_owned_by_aicc003b(tmp_path):
     dataset = _hybrid_dataset([1.0, 0.5, 0.0])
     dataset["lev_bnds"] = (
         ("lev", "nv"),
@@ -450,11 +450,17 @@ def test_vertical_bounds_follow_stored_direction(tmp_path):
     dataset["lev"].attrs["bounds"] = "lev_bnds"
 
     with _open_netcdf(tmp_path, "vertical_bounds_direction", dataset) as nc:
-        results = _vertical_checker().check_vertical_direction(nc)
+        checker = _vertical_checker()
+        coordinate_results = checker.check_vertical(nc)
+        direction_results = checker.check_vertical_direction(nc)
 
+    assert not any(
+        "not ordered upper-to-lower" in message
+        for message in _messages(coordinate_results, BaseCheck.HIGH)
+    )
     assert any(
         "not ordered upper-to-lower" in message
-        for message in _messages(results, BaseCheck.HIGH)
+        for message in _messages(direction_results, BaseCheck.HIGH)
     )
 
 

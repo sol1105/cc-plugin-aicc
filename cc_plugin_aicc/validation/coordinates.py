@@ -21,6 +21,7 @@ from cc_plugin_aicc.validation.attributes import (
     _check_valid_range,
 )
 from cc_plugin_aicc.validation.bounds import (
+    _check_bounds_direction,
     _check_bounds_reference,
     _check_bounds_structure,
 )
@@ -160,6 +161,15 @@ def _check_scalar_coord(
                 bnds_name,
                 coord_var,
                 ce,
+                scalar=True,
+            )
+            _check_bounds_direction(
+                ctx,
+                coord_var,
+                coord_var_name,
+                bnds_var,
+                bnds_name,
+                ce.get("stored_direction", ""),
                 scalar=True,
             )
             if bounds_values and value:
@@ -347,6 +357,14 @@ def _check_multi_value_coord(
             if bnds_var is not None:
                 _check_bounds_structure(
                     ctx, medium_ctx, bnds_var, bnds_name, coord_var, ce
+                )
+                _check_bounds_direction(
+                    ctx,
+                    coord_var,
+                    coord_var_name,
+                    bnds_var,
+                    bnds_name,
+                    ce.get("stored_direction", ""),
                 )
                 if req_pairs:
                     try:

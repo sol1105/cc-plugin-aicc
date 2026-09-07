@@ -11,6 +11,7 @@ from cc_plugin_aicc.utils import (
 )
 from cc_plugin_aicc.validation.attributes import _check_coord_attrs, _check_coord_type
 from cc_plugin_aicc.validation.bounds import (
+    _check_bounds_direction,
     _check_bounds_reference,
     _check_bounds_structure,
 )
@@ -151,6 +152,14 @@ class TimeChecks:
                             t_var,
                             ce,
                         )
+                        _check_bounds_direction(
+                            ctx,
+                            t_var,
+                            resolved_t,
+                            ds.variables[clim_attr],
+                            clim_attr,
+                            ce.get("stored_direction", ""),
+                        )
                 regular_bounds = _ncattr(t_var, "bounds")
                 if regular_bounds:
                     ctx.add_failure(
@@ -184,6 +193,14 @@ class TimeChecks:
                         ctx.add_pass()
                     _check_bounds_structure(
                         ctx, medium_ctx, bnds_var, bnds_name, t_var, ce
+                    )
+                    _check_bounds_direction(
+                        ctx,
+                        t_var,
+                        resolved_t,
+                        bnds_var,
+                        bnds_name,
+                        ce.get("stored_direction", ""),
                     )
 
             results.append(ctx.to_result())

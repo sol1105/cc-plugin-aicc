@@ -14,6 +14,7 @@ from cc_plugin_aicc.validation.attributes import (
     _check_strict_monotonicity,
 )
 from cc_plugin_aicc.validation.bounds import (
+    _check_bounds_direction,
     _check_bounds_reference,
     _check_bounds_structure,
     _check_trailing_dimension,
@@ -751,6 +752,14 @@ class GridChecks:
                         bnds_ctx.add_pass()
                     _check_bounds_structure(
                         bnds_ctx, medium_ctx, bnds_var, bnds_name, var, ce
+                    )
+                    _check_bounds_direction(
+                        bnds_ctx,
+                        var,
+                        var_name,
+                        bnds_var,
+                        bnds_name,
+                        ce.get("stored_direction", ""),
                     )
                 results.append(bnds_ctx.to_result())
 
